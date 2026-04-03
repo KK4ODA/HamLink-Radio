@@ -910,6 +910,196 @@ def get_varac_next_qsy():
     return None
 
 
+def varac_send_broadcast(message, to="ALL"):
+    """Send a VarAC broadcast by automating the VarAC UI.
+    Finds VarAC window, opens broadcast dialog, fills fields, and clicks send.
+    Position-independent — uses window handles, not screen coordinates.
+    Returns (ok, error_string)."""
+    if sys.platform != "win32":
+        return False, "VarAC broadcast automation only supported on Windows"
+    try:
+        import win32gui, win32con
+    except ImportError:
+        return False, "pywin32 not installed (pip install pywin32)"
+
+    import ctypes
+    user32 = ctypes.windll.user32
+    WM_SETTEXT = 0x000C
+    BM_CLICK = 0x00F5
+
+    def _send_text(hwnd, text):
+        """Set text on a control using SendMessageW (works across 32/64-bit)."""
+        user32.SendMessageW(hwnd, WM_SETTEXT, 0, text)
+
+    def _find_window_by_title(pattern):
+        """Find a top-level window whose title contains pattern."""
+        import re
+        result = []
+        def callback(h, _):
+            if win32gui.IsWindowVisible(h):
+                title = win32gui.GetWindowText(h)
+                if re.search(pattern, title, re.IGNORECASE):
+                    result.append(h)
+            return True
+        win32gui.EnumWindows(callback, None)
+        return result[0] if result else None
+
+    def _get_children(hwnd):
+        children = []
+        def callback(h, _):
+            children.append(h)
+            return True
+        try:
+            win32gui.EnumChildWindows(hwnd, callback, None)
+        except Exception:
+            pass
+        return children
+
+    def _find_child_by_text(parent, text):
+        for h in _get_children(parent):
+            try:
+                if win32gui.GetWindowText(h) == text and win32gui.IsWindowVisible(h):
+                    return h
+            except Exception:
+                pass
+        return None
+
+    def _find_edit_near_label(dialog, label_text):
+        """Find an Edit control that is a sibling of a label with the given text."""
+        children = _get_children(dialog)
+        label_hwnd = None
+        for h in children:
+            try:
+                if win32gui.GetWindowText(h) == label_text:
+                    label_hwnd = h
+                    break
+            except Exception:
+                pass
+        if not label_hwnd:
+            return None
+        label_rect = win32gui.GetWindowRect(label_hwnd)
+        # Find the closest Edit control to the right of or below the label
+        best = None
+        best_dist = 99999
+        for h in children:
+            try:
+                cls = win32gui.GetClassName(h)
+                if "Edit" not in cls and "edit" not in cls.lower():
+                    continue
+                r = win32gui.GetWindowRect(h)
+                # Edit should be to the right of or below the label
+                dx = r[0] - label_rect[0]
+                dy = r[1] - label_rect[1]
+                dist = abs(dy) * 2 + abs(dx)  # weight vertical proximity
+                if abs(dy) < 100 and dx > -50 and dist < best_dist:
+                    best = h
+                    best_dist = dist
+            except Exception:
+                pass
+        return best
+
+    # Step 1: Find VarAC main window
+    varac_hwnd = _find_window_by_title(r"VarAC.*V\d+")
+    if not varac_hwnd:
+        return False, "VarAC window not found"
+    log.info("VarAC broadcast: found main window hwnd=%d", varac_hwnd)
+
+    # Step 2: Find and click the BROADCAST button on the main window
+    broadcast_btn = _find_child_by_text(varac_hwnd, "BROADCAST")
+    if not broadcast_btn:
+        return False, "BROADCAST button not found in VarAC"
+    win32gui.SendMessage(broadcast_btn, BM_CLICK, 0, 0)
+    log.info("VarAC broadcast: clicked BROADCAST button")
+    time.sleep(0.8)
+
+    # Step 3: Find the broadcast dialog
+    dialog_hwnd = _find_window_by_title("Broadcast message")
+    if not dialog_hwnd:
+        return False, "Broadcast dialog did not open"
+    log.info("VarAC broadcast: dialog opened hwnd=%d", dialog_hwnd)
+
+    # Step 4: Find TO field — it's a ComboBox with an inner Edit control
+    to_edit = None
+    for h in _get_children(dialog_hwnd):
+        cls = win32gui.GetClassName(h)
+        if "COMBOBOX" in cls.upper():
+            # Get the inner Edit of the ComboBox
+            for sh in _get_children(h):
+                if "Edit" in win32gui.GetClassName(sh):
+                    to_edit = sh
+                    break
+            if to_edit:
+                break
+    if not to_edit:
+        log.warning("VarAC broadcast: TO ComboBox not found, trying any Edit near TO label")
+        to_edit = _find_edit_near_label(dialog_hwnd, "TO:")
+    if to_edit:
+        _send_text(to_edit, to)
+        log.info("VarAC broadcast: set TO=%s", to)
+    else:
+        log.warning("VarAC broadcast: could not find TO field")
+
+    # Step 5: Find MESSAGE field — it's a WPF HwndWrapper that needs click + WM_CHAR
+    msg_field = None
+    children = _get_children(dialog_hwnd)
+    for h in children:
+        try:
+            cls = win32gui.GetClassName(h)
+            if "HwndWrapper" in cls:
+                msg_field = h
+                break
+        except Exception:
+            pass
+    if not msg_field:
+        # Fallback: find the largest control in the dialog (the message area)
+        best_area = 0
+        for h in children:
+            try:
+                r = win32gui.GetWindowRect(h)
+                area = (r[2] - r[0]) * (r[3] - r[1])
+                if area > best_area and area > 5000 and h != to_edit:
+                    msg_field = h
+                    best_area = area
+            except Exception:
+                pass
+    if msg_field:
+        # Bring dialog to foreground and click on the message field to focus it
+        user32.SetForegroundWindow(dialog_hwnd)
+        time.sleep(0.2)
+        r = win32gui.GetWindowRect(msg_field)
+        cx, cy = (r[0] + r[2]) // 2, (r[1] + r[3]) // 2
+        user32.SetCursorPos(cx, cy)
+        time.sleep(0.1)
+        user32.mouse_event(2, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTDOWN
+        user32.mouse_event(4, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
+        time.sleep(0.2)
+        # Type message character by character via WM_CHAR
+        msg_text = message[:81]
+        for ch in msg_text:
+            user32.SendMessageW(msg_field, 0x0102, ord(ch), 0)  # WM_CHAR
+        log.info("VarAC broadcast: typed MESSAGE (%d chars)", len(msg_text))
+    else:
+        # Close dialog and bail
+        close_btn = _find_child_by_text(dialog_hwnd, "CLOSE")
+        if close_btn:
+            win32gui.SendMessage(close_btn, BM_CLICK, 0, 0)
+        return False, "Could not find MESSAGE field in broadcast dialog"
+
+    # Step 6: Click BROADCAST AND CLOSE
+    send_btn = _find_child_by_text(dialog_hwnd, "BROADCAST AND CLOSE")
+    if not send_btn:
+        send_btn = _find_child_by_text(dialog_hwnd, "BROADCAST")
+    if not send_btn:
+        close_btn = _find_child_by_text(dialog_hwnd, "CLOSE")
+        if close_btn:
+            win32gui.SendMessage(close_btn, BM_CLICK, 0, 0)
+        return False, "Could not find BROADCAST button in dialog"
+
+    win32gui.SendMessage(send_btn, BM_CLICK, 0, 0)
+    log.info("VarAC broadcast sent: TO=%s MSG=%s", to, message[:60])
+    return True, ""
+
+
 def _launch_varac():
     """Auto-launch VarAC if configured and not already running."""
     global _varac_proc
@@ -2614,8 +2804,28 @@ def api_sitrep():
         if not ok:
             log.warning("Sitrep APRS bulletin failed: %s", err)
 
+    # Send VarAC broadcast via UI automation
+    varac_broadcast_sent = False
+    varac_broadcast_msg = ""
+    freq = get_varac_frequency()
+    qsy = get_varac_next_qsy()
+    varac_parts = [f"SITREP#{num:03d} on BBS"]
+    if qsy:
+        varac_parts.append(f"QSY {qsy[0]}Z {qsy[1]}")
+    varac_parts.append("pls connect & relay")
+    varac_broadcast_msg = " ".join(varac_parts)[:81]
+    try:
+        ok, err = varac_send_broadcast(varac_broadcast_msg, to="ALL")
+        varac_broadcast_sent = ok
+        if not ok:
+            log.warning("VarAC broadcast failed: %s", err)
+    except Exception as e:
+        log.warning("VarAC broadcast error: %s", e)
+
     return jsonify({"ok": True, "number": num, "filename": filename, "path": filepath,
-                    "bulletin_sent": bulletin_sent, "bulletin_msg": bulletin_msg})
+                    "bulletin_sent": bulletin_sent, "bulletin_msg": bulletin_msg,
+                    "varac_broadcast_sent": varac_broadcast_sent,
+                    "varac_broadcast_msg": varac_broadcast_msg})
 
 
 @app.route("/api/sitrep/latest")
@@ -3719,6 +3929,8 @@ async function sendSitrep(){
       var msg='SITREP #'+String(d.number).padStart(3,'0')+' posted to BBS: '+d.filename;
       if(d.bulletin_sent)msg+='\nAPRS bulletin sent: '+d.bulletin_msg;
       else if(d.bulletin_msg)msg+='\nAPRS bulletin failed to send';
+      if(d.varac_broadcast_sent)msg+='\nVarAC broadcast sent: '+d.varac_broadcast_msg;
+      else if(d.varac_broadcast_msg)msg+='\nVarAC broadcast failed';
       res.textContent=msg;
     }else{
       res.className='sitrep-result err';res.textContent='Error: '+(d.error||'Unknown');
