@@ -1,0 +1,17 @@
+# Sensitive — contains API keys, passcodes, callsign config
+config.json
+
+# Personal data
+message_log.csv
+.pat_seen_ids
+
+# Build artifacts
+HomeLink_Radio.zip
+__pycache__/
+*.pyc
+dist/
+build/
+*.spec
+
+# Claude Code workspace
+.claude/
