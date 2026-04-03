@@ -322,6 +322,7 @@ A Sitrep (Situation Report) is a structured status update posted to the VarAC BB
 5. HomeLink:
    - Saves the sitrep as a text file in the VarAC BBS folder
    - Renames the previous sitrep to archive it
+   - Sends a VarAC broadcast to all stations on the current frequency
    - Sends an APRS bulletin announcing the sitrep
 
 ### Sitrep Fields
@@ -368,9 +369,24 @@ REMARKS:    Tree down on Elm St, roads passable
 - Sequential numbering (001, 002, 003...) makes it obvious if one was missed during relay
 - UTC timestamps ensure consistency across time zones
 
+### VarAC Broadcast
+
+When a sitrep is posted, HomeLink automatically sends a VarAC broadcast to all stations on the current frequency:
+
+```
+SITREP#005 on BBS QSY 13:30Z 14.105 pls connect & relay
+```
+
+This broadcast:
+- Reaches all VarAC operators currently on the same frequency
+- Is sent by automating VarAC's own broadcast dialog (HomeLink opens the dialog, fills the TO and MESSAGE fields, and clicks Send — all via window handles, not screen coordinates)
+- VarAC must be running and idle (not in a QSO) for the broadcast to transmit immediately; if busy, VarAC queues it
+
+This is the most targeted announcement — it hits exactly the people who are already running VarAC and capable of connecting to your BBS.
+
 ### APRS Bulletin Announcement
 
-When a sitrep is posted, HomeLink automatically sends an APRS bulletin to nearby stations:
+In addition to the VarAC broadcast, HomeLink sends an APRS bulletin to reach a wider audience:
 
 ```
 SITREP#003 KK4ODA BBS 7.105MHz QSY 13:30Z 14.105 pls relay
@@ -381,16 +397,18 @@ This bulletin:
 - Includes the current VarAC frequency so hams know where to connect
 - Includes the next scheduled frequency change (QSY) time and frequency
 - Reaches all APRS-capable stations in the area
+- Visible on [aprs.fi](https://aprs.fi) raw packets view
 
 ### Crowdsourced Relay
 
 The sitrep system enables a powerful relay workflow:
 
-1. Home station posts sitrep to BBS and sends APRS bulletin
-2. Nearby hams see the bulletin on their APRS client or radio
-3. They connect to the home station's VarAC BBS and download the sitrep
-4. If they can reach the traveler on any band, they relay the information
-5. The traveler gets the full family status update even without direct contact
+1. Home station posts sitrep to BBS, sends VarAC broadcast, and sends APRS bulletin
+2. VarAC operators on the same frequency see the broadcast immediately
+3. Other hams see the APRS bulletin on their APRS client or radio
+4. They connect to the home station's VarAC BBS and download the sitrep
+5. If they can reach the traveler on any band, they relay the information
+6. The traveler gets the full family status update even without direct contact
 
 ---
 
@@ -425,9 +443,10 @@ The sitrep system enables a powerful relay workflow:
 1. Before the storm: Post sitrep "All OK, preparing to shelter in place"
 2. During: Post sitrep with utility status: "Power out since 1400Z, on generator"
 3. If evacuating: Post sitrep with new location (GPS or What3Words) and relocation status
-4. APRS bulletins automatically alert the ham community after each sitrep
-5. If internet goes down, APRS messages continue via RF through local digipeaters
-6. Winlink messages route via VARA FM RF gateway to reach the traveler's inbox
+4. Each sitrep automatically sends a VarAC broadcast to all stations on frequency and an APRS bulletin to the wider ham community
+5. Nearby VarAC operators connect to your BBS and relay the sitrep to the traveler
+6. If internet goes down, APRS messages continue via RF through local digipeaters
+7. Winlink messages route via VARA FM RF gateway to reach the traveler's inbox
 
 ### 8.3 Off-Grid Backcountry Trip
 
@@ -451,12 +470,13 @@ The sitrep system enables a powerful relay workflow:
 
 **Workflow:**
 1. Family member posts a sitrep describing the situation at home
-2. APRS bulletin goes out: "SITREP#005 KK4ODA BBS 7.105MHz pls relay"
-3. A nearby ham (say, K5OOM) sees the bulletin
-4. K5OOM connects to the home station's VarAC BBS and downloads the sitrep
-5. K5OOM is on a different band where they can reach the traveler
-6. K5OOM relays the family's status to the traveler
-7. The traveler now knows their family is safe and what their situation is
+2. VarAC broadcast goes out to all stations on frequency: "SITREP#005 on BBS pls connect & relay"
+3. APRS bulletin also goes out: "SITREP#005 KK4ODA BBS 7.105MHz pls relay"
+4. A nearby ham (say, K5OOM) sees the VarAC broadcast or APRS bulletin
+5. K5OOM connects to the home station's VarAC BBS and downloads the sitrep
+6. K5OOM is on a different band where they can reach the traveler
+7. K5OOM relays the family's status to the traveler
+8. The traveler now knows their family is safe and what their situation is
 
 ---
 
