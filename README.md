@@ -31,7 +31,7 @@ When your wife taps a quick reply or types a message and hits **Send Reply**, th
 
 **Important:** The home VarAC station must be running and connected to VARA modem for replies to be transmitted. The app queues the reply — VarAC handles the actual radio transmission.
 
-## Setup for Your Wife
+## Setup for Your Significant Other
 
 After initial configuration:
 1. Bookmark `http://<pc-ip>:5000` on her phone
