@@ -7,9 +7,9 @@ A friendly web app that lets your family know when you've checked in via ham rad
 - **Shows a clear "checked in" status** when you send a VMail from the field
 - **Alerts with sound and phone notifications** so she knows immediately
 - **Displays your messages** with your name instead of callsigns — no SNR, no bands, no jargon
-- **Lets her reply** by typing a message or tapping a pre-written quick reply — the reply is queued as a VMail in VarAC's outbox
+- **Let's he/she reply** by typing a message or tapping a pre-written quick reply — the reply is queued as a VMail in VarAC's outbox
 - **Monitors relay notifications** so she knows if a parked message is waiting
-- **Works on her phone** — fully mobile-responsive, accessible from any browser on the local network
+- **Works on his/her phone** — fully mobile-responsive, accessible from any browser on the local network
 
 ## Quick Start
 
@@ -27,7 +27,7 @@ A friendly web app that lets your family know when you've checked in via ham rad
 
 ## How Replies Work
 
-When your wife taps a quick reply or types a message and hits **Send Reply**, the app inserts a new VMail into VarAC's outbox. VarAC will send it on the next connection with your remote station.
+When your significant other taps a quick reply or types a message and hits **Send Reply**, the app inserts a new VMail into VarAC's outbox. VarAC will send it on the next connection with your remote station.
 
 **Important:** The home VarAC station must be running and connected to VARA modem for replies to be transmitted. The app queues the reply — VarAC handles the actual radio transmission.
 
@@ -35,10 +35,10 @@ When your wife taps a quick reply or types a message and hits **Send Reply**, th
 
 After initial configuration:
 1. Bookmark `http://<pc-ip>:5000` on her phone
-2. She clicks **Start** and allows notifications
-3. When you send a VMail from the field, she sees your name and message with a chime
-4. She taps **Got it** to acknowledge, or **Reply** to send a message back
-5. Pushover sends a notification to her phone even if the browser tab is closed
+2. She/He clicks **Start** and allows notifications
+3. When you send a VMail from the field, she/he sees your name and message with a chime
+4. She/He taps **Got it** to acknowledge, or **Reply** to send a message back
+5. Pushover sends a notification to her/his phone even if the browser tab is closed
 
 ## Files
 
