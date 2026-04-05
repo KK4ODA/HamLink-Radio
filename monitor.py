@@ -800,6 +800,19 @@ def _is_process_running(exe_name):
     except Exception:
         return False
 
+def _read_varac_ini(ini_path):
+    """Read a VarAC .ini file with encoding fallback (utf-8 -> cp1252 -> latin-1)."""
+    import configparser
+    cp = configparser.ConfigParser()
+    for enc in ("utf-8", "cp1252", "latin-1"):
+        try:
+            cp.read(ini_path, encoding=enc)
+            return cp
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    return None
+
+
 def get_bbs_directory():
     """Return the BBS directory path. Priority: HomeLink config override > VarAC .ini > None."""
     with cfglock:
@@ -809,12 +822,11 @@ def get_bbs_directory():
     ini_path = _varac_ini_path()
     if ini_path:
         try:
-            import configparser
-            cp = configparser.ConfigParser()
-            cp.read(ini_path, encoding="utf-8")
-            bbs_dir = cp.get("BBS", "BBSDirectory", fallback="")
-            if bbs_dir:
-                return bbs_dir
+            cp = _read_varac_ini(ini_path)
+            if cp:
+                bbs_dir = cp.get("BBS", "BBSDirectory", fallback="")
+                if bbs_dir:
+                    return bbs_dir
         except Exception as e:
             log.warning("Failed to read BBS dir from %s: %s", ini_path, e)
     return None
@@ -840,9 +852,9 @@ def get_varac_frequency():
     if not ini_path:
         return None
     try:
-        import configparser
-        cp = configparser.ConfigParser()
-        cp.read(ini_path, encoding="utf-8")
+        cp = _read_varac_ini(ini_path)
+        if not cp:
+            return None
         raw = cp.get("RIG_CONTROL", "LastFrequency", fallback="")
         if raw:
             # Format is "7.105.000" — convert to "7.105"
@@ -864,9 +876,9 @@ def get_varac_next_qsy():
     varac_dir = os.path.dirname(ini_path)
     # Check for custom schedule path first, then default
     try:
-        import configparser
-        cp = configparser.ConfigParser()
-        cp.read(ini_path, encoding="utf-8")
+        cp = _read_varac_ini(ini_path)
+        if not cp:
+            return None
         custom = cp.get("RIG_CONTROL", "FrequencyScheduleCustomFilePath", fallback="").strip()
         sched_enabled = cp.get("RIG_CONTROL", "FrequencySchedule", fallback="OFF").strip().upper()
     except Exception:
