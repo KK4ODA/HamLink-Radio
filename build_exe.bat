@@ -47,6 +47,14 @@ if %ERRORLEVEL% NEQ 0 (
 )
 echo  [OK] aprslib ready
 
+:: Check/install pywin32 (for VarAC broadcast automation)
+python -c "import win32gui" 2>nul
+if %ERRORLEVEL% NEQ 0 (
+    echo  Installing pywin32...
+    python -m pip install pywin32 --quiet
+)
+echo  [OK] pywin32 ready
+
 echo.
 echo  Building standalone executable...
 echo  This may take 1-2 minutes...
@@ -64,7 +72,11 @@ python -m PyInstaller ^
     --hidden-import=csv ^
     --hidden-import=winsound ^
     --hidden-import=aprslib ^
-    --add-data "config.json;." ^
+    --hidden-import=win32gui ^
+    --hidden-import=win32api ^
+    --hidden-import=win32con ^
+    --hidden-import=ctypes ^
+    --hidden-import=configparser ^
     --noconfirm ^
     --clean ^
     monitor.py
