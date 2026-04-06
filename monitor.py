@@ -1522,6 +1522,11 @@ def _pat_check_inbox():
         with cfglock:
             opname = config.get("operator_name", "") or ""
 
+        # Get tactical addresses for filtering
+        with cfglock:
+            home_tactical = config.get("pat", {}).get("home_tactical", "").strip().upper()
+            traveler_tactical = config.get("pat", {}).get("traveler_tactical", "").strip().upper()
+
         for msg in data:
             mid = msg.get("MID", "") or msg.get("mid", "") or msg.get("Id", "") or msg.get("id", "")
             if not mid:
@@ -1541,6 +1546,43 @@ def _pat_check_inbox():
                 from_addr = from_field
             else:
                 from_addr = str(from_field) if from_field else ""
+
+            # Extract TO addresses
+            to_field = msg.get("To", msg.get("to", []))
+            to_addrs = []
+            if isinstance(to_field, list):
+                for t_entry in to_field:
+                    if isinstance(t_entry, dict):
+                        to_addrs.append((t_entry.get("Addr", "") or t_entry.get("addr", "")).upper())
+                    elif isinstance(t_entry, str):
+                        to_addrs.append(t_entry.upper())
+            elif isinstance(to_field, str):
+                to_addrs.append(to_field.upper())
+
+            # Filter: only alert on messages FROM the traveler TO the home tactical address
+            from_upper = from_addr.upper()
+            from_match = False
+            if traveler_tactical and traveler_tactical in from_upper:
+                from_match = True
+            # Also match if from a watched callsign
+            if not from_match and _match(from_addr):
+                from_match = True
+            if not from_match:
+                log.debug("Winlink skip: FROM=%s does not match traveler or watch list", from_addr)
+                continue
+
+            to_match = False
+            if not home_tactical:
+                to_match = True  # No home tactical configured — accept all
+            else:
+                for addr in to_addrs:
+                    if home_tactical in addr:
+                        to_match = True
+                        break
+            if not to_match:
+                log.debug("Winlink skip: TO=%s does not match home tactical %s", to_addrs, home_tactical)
+                continue
+
             body_text = msg.get("Body", "") or msg.get("body", "")
             # List endpoint doesn't include body — fetch individual message
             if not body_text and mid:
@@ -1554,7 +1596,7 @@ def _pat_check_inbox():
             t = msg.get("Date", "") or msg.get("date", "") or datetime.now(timezone.utc).isoformat()
             name = opname or from_addr
 
-            log.info("Winlink inbox msg: MID=%s From=%s Subject=%s Body=%d chars", mid[:20], from_addr, subject[:40], len(body_text))
+            log.info("Winlink inbox msg: MID=%s From=%s To=%s Subject=%s Body=%d chars", mid[:20], from_addr, to_addrs, subject[:40], len(body_text))
 
             alert = {
                 "id": f"winlink-{mid}",
@@ -1562,7 +1604,7 @@ def _pat_check_inbox():
                 "time": t,
                 "from_call": from_addr,
                 "from_name": name,
-                "to": "",
+                "to": ", ".join(to_addrs),
                 "subject": subject,
                 "message": body_text[:500] if body_text else "",
                 "urgent": False,
