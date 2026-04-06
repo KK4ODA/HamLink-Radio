@@ -1542,10 +1542,19 @@ def _pat_check_inbox():
             else:
                 from_addr = str(from_field) if from_field else ""
             body_text = msg.get("Body", "") or msg.get("body", "")
+            # List endpoint doesn't include body — fetch individual message
+            if not body_text and mid:
+                try:
+                    detail_url = _pat_api_url() + f"/mailbox/in/{mid}"
+                    detail_resp = urllib.request.urlopen(urllib.request.Request(detail_url), timeout=10)
+                    detail = json.loads(detail_resp.read().decode())
+                    body_text = detail.get("Body", "") or detail.get("body", "")
+                except Exception as e:
+                    log.debug("Pat: could not fetch body for %s: %s", mid[:20], e)
             t = msg.get("Date", "") or msg.get("date", "") or datetime.now(timezone.utc).isoformat()
             name = opname or from_addr
 
-            log.info("Winlink inbox msg: MID=%s From=%s Subject=%s", mid[:20], from_addr, subject[:40])
+            log.info("Winlink inbox msg: MID=%s From=%s Subject=%s Body=%d chars", mid[:20], from_addr, subject[:40], len(body_text))
 
             alert = {
                 "id": f"winlink-{mid}",
