@@ -182,10 +182,11 @@ Pushover sends push notifications to your phone when a message arrives. Requires
 | **API Token** | Your Pushover application token (create an app at Pushover). |
 | **Priority** | `-2` (silent), `-1` (quiet), `0` (normal), `1` (high), `2` (emergency with repeat). |
 | **Sound** | Pushover notification sound name. |
+| **Include Quick Replies** | Off by default. When enabled, notifications include clickable reply links with a confirmation step before transmitting. |
 
 Click "Test Pushover" to send a test notification to your phone.
 
-**Quick replies via Pushover:** When a notification arrives on your phone, it includes clickable links for each of your quick replies. Tapping one sends the reply immediately via the selected channel — no need to open the web interface.
+**Quick replies via Pushover:** When enabled in Settings (off by default), Pushover notifications include clickable links for each of your quick replies. Tapping a link opens a confirmation page showing the message and a reminder that transmissions require a valid amateur radio license (FCC Part 97). A second tap on "Confirm & Send" is required before the message is transmitted.
 
 ### 5.6 APRS Messaging
 
@@ -299,7 +300,7 @@ You can select multiple channels to maximize delivery chances. Click "Send" to t
 
 ### 6.4 Quick Replies from Your Phone
 
-If Pushover is configured, incoming message notifications on your phone include clickable quick reply links. Tapping one sends the reply immediately — useful when you're away from the computer.
+If Pushover quick replies are enabled in Settings, incoming message notifications on your phone include clickable reply links. Tapping a link opens a confirmation page with a licensing reminder — a second tap is required to actually transmit. This prevents accidental transmissions.
 
 ### 6.5 Message Log
 
@@ -533,6 +534,7 @@ Automatic control is permitted for digital stations on certain frequencies. The 
 **What this means for HamLink Radio:**
 - APRS beacons are transmitted automatically at configured intervals — this is standard practice and permitted on APRS frequencies
 - APRS bulletins and message replies are initiated by a human operator (the family member) through the web interface, not automatically triggered
+- Pushover quick reply links (when enabled) require a two-step confirmation before transmitting, with a licensing reminder displayed on the confirmation page
 - VarAC BBS serves files to connecting stations — the BBS operates under VarAC's own automatic control provisions
 - The control operator should be reachable and able to shut down the station if needed
 

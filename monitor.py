@@ -2350,10 +2350,52 @@ def api_stop_alarm():
 
 @app.route("/api/pushover_reply")
 def api_pushover_reply():
-    """Handle quick reply links clicked from Pushover notifications.
-    This is a GET endpoint so it works as a clickable URL in the notification."""
+    """Show confirmation page before transmitting. Requires explicit tap to send."""
     channel = request.args.get("channel", "varac")
     msg = request.args.get("message", "").strip()
+    if not msg:
+        return "<html><body><h2>Error: No message</h2></body></html>", 400
+    import html as html_mod
+    safe_msg = html_mod.escape(msg)
+    safe_channel = html_mod.escape(channel)
+    return f"""<html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+    <style>
+      body{{font-family:system-ui;padding:30px 20px;background:#f8f9fb;color:#1e293b;max-width:480px;margin:0 auto}}
+      .card{{background:#fff;border-radius:14px;padding:24px;box-shadow:0 1px 3px rgba(0,0,0,0.1);margin-bottom:16px}}
+      h2{{font-size:20px;margin-bottom:12px}}
+      .msg{{background:#f1f5f9;padding:12px;border-radius:8px;font-size:15px;margin:12px 0}}
+      .warn{{background:#fef3c7;border:1px solid #f59e0b;border-radius:8px;padding:12px;font-size:13px;color:#92400e;margin:16px 0}}
+      .btn{{display:block;width:100%;padding:16px;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;margin-top:10px}}
+      .btn-send{{background:#16a34a;color:#fff}}
+      .btn-cancel{{background:#e2e8f0;color:#64748b}}
+      .via{{font-size:13px;color:#64748b;margin-top:4px}}
+    </style></head>
+    <body>
+      <div class="card">
+        <h2>Confirm Transmission</h2>
+        <p>You are about to transmit the following message via amateur radio:</p>
+        <div class="msg">{safe_msg}</div>
+        <div class="via">Channel: {safe_channel.upper()}</div>
+      </div>
+      <div class="warn">
+        All amateur radio transmissions are made under the authority of the station license.
+        Only licensed amateur radio operators or authorized third parties under the direct
+        supervision of a licensed operator may initiate transmissions (FCC Part 97).
+      </div>
+      <form method="POST" action="/api/pushover_reply_send">
+        <input type="hidden" name="channel" value="{safe_channel}">
+        <input type="hidden" name="message" value="{safe_msg}">
+        <button type="submit" class="btn btn-send">Confirm &amp; Send</button>
+      </form>
+      <button class="btn btn-cancel" onclick="window.close()">Cancel</button>
+    </body></html>"""
+
+
+@app.route("/api/pushover_reply_send", methods=["POST"])
+def api_pushover_reply_send():
+    """Actually send the quick reply after user confirms."""
+    channel = request.form.get("channel", "varac")
+    msg = request.form.get("message", "").strip()
     if not msg:
         return "<html><body><h2>Error: No message</h2></body></html>", 400
 
@@ -2417,11 +2459,13 @@ def api_pushover_reply():
         state["reply_status"] = f"Replied via {channel}: {msg[:40]}"
     log.info("Pushover quick reply [%s]: %s -> %s", channel, msg[:40], result)
 
-    # Return a simple confirmation page
+    import html as html_mod
+    safe_result = html_mod.escape(result)
+    safe_msg = html_mod.escape(msg[:50])
     return f"""<html><head><meta name="viewport" content="width=device-width,initial-scale=1">
     <style>body{{font-family:system-ui;text-align:center;padding:40px 20px;background:#f0fdf4;color:#166534}}
     h2{{font-size:20px}}p{{color:#64748b;margin-top:8px}}</style></head>
-    <body><h2>✓ Reply Sent</h2><p>{result}</p><p>"{msg[:50]}"</p></body></html>"""
+    <body><h2>Reply Sent</h2><p>{safe_result}</p><p>"{safe_msg}"</p></body></html>"""
 
 
 @app.route("/api/pat_config", methods=["GET"])
