@@ -136,7 +136,8 @@ DEFAULT_CONFIG = {
     "operator_name": "",
     "home_callsign": "",
     "pushover": {"enabled": False, "user_key": "", "api_token": "",
-                 "priority": 1, "retry": 60, "expire": 3600, "sound": "pushover"},
+                 "priority": 1, "retry": 60, "expire": 3600, "sound": "pushover",
+                 "quick_replies": False},
     "aprs": {"enabled": False, "home_ssid": "-5", "traveler_ssids": "-7",
              "passcode": "", "server": "rotate.aprs2.net", "port": 14580,
              "use_mailbox": False, "rf_fallback": False},
@@ -1916,7 +1917,8 @@ def send_pushover(title, message, reply_channel="varac"):
         base_url = f"http://{local_ip}:{web_port}"
         html_body = message.replace("\n", "<br>")
 
-        if quick_replies:
+        po_quick = po.get("quick_replies", False)
+        if po_quick and quick_replies:
             html_body += "<br><br><b>Quick Replies:</b><br>"
             for qr in quick_replies[:4]:  # Max 4 quick replies
                 qr_short = qr[:67] if reply_channel == "aprs" else qr
@@ -2248,6 +2250,7 @@ def api_status():
                 "api_token": config.get("pushover", {}).get("api_token", ""),
                 "priority": config.get("pushover", {}).get("priority", 1),
                 "sound": config.get("pushover", {}).get("sound", "pushover"),
+                "quick_replies": config.get("pushover", {}).get("quick_replies", False),
             },
             "aprs": {
                 "enabled": config.get("aprs", {}).get("enabled", False),
@@ -2650,7 +2653,7 @@ def api_set_config():
             if k in d:
                 config[k] = d[k]
         if "pushover" in d:
-            for pk in ["enabled", "user_key", "api_token", "priority", "sound"]:
+            for pk in ["enabled", "user_key", "api_token", "priority", "sound", "quick_replies"]:
                 if pk in d["pushover"]:
                     config["pushover"][pk] = d["pushover"][pk]
         if "aprs" in d:
@@ -3442,6 +3445,9 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
             <option value="magic">Magic</option><option value="persistent">Persistent</option>
             <option value="siren">Siren</option><option value="spacealarm">Space Alarm</option>
             <option value="none">Silent</option></select></div>
+        <div class="fg" style="display:flex;align-items:center;gap:8px">
+          <div class="toggle" id="cPoQuickReplies" onclick="this.classList.toggle('on')"></div>
+          <label class="fl" style="margin:0">Include Quick Replies in notifications</label></div>
         <div class="fg"><button class="btn-a" onclick="testPo()">Send Test</button>
           <div class="tr" id="poTr"></div></div>
       </div>
@@ -4039,6 +4045,7 @@ async function fillForm(){
   document.getElementById('cPoToken').value=po.api_token||'';
   document.getElementById('cPoPri').value=String(po.priority||1);
   document.getElementById('cPoSnd').value=po.sound||'pushover';
+  document.getElementById('cPoQuickReplies').classList.toggle('on',!!po.quick_replies);
   const ap=c.aprs||{};
   document.getElementById('cAprsOn').classList.toggle('on',!!ap.enabled);
   document.getElementById('cAprsSsid').value=ap.home_ssid||'-5';
@@ -4098,6 +4105,7 @@ async function saveSett(){
       api_token:document.getElementById('cPoToken').value.trim(),
       priority:parseInt(document.getElementById('cPoPri').value),
       sound:document.getElementById('cPoSnd').value,
+      quick_replies:document.getElementById('cPoQuickReplies').classList.contains('on'),
     },
     aprs:{
       enabled:document.getElementById('cAprsOn').classList.contains('on'),
