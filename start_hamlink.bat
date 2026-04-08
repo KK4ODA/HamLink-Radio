@@ -1,11 +1,11 @@
 @echo off
 setlocal EnableDelayedExpansion
-title HomeLink Radio — Launcher
+title HamLink Radio — Launcher
 color 0A
 
 echo.
 echo  ========================================
-echo    HomeLink Radio
+echo    HamLink Radio
 echo    Dependency Check and Launch
 echo  ========================================
 echo.

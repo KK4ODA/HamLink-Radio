@@ -5,7 +5,7 @@ title: "[Feature] "
 labels: enhancement
 ---
 
-**What would you like HomeLink Radio to do?**
+**What would you like HamLink Radio to do?**
 
 
 **Why would this be useful?**

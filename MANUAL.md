@@ -1,8 +1,8 @@
-# HomeLink Radio — User Manual
+# HamLink Radio — User Manual
 
 **Version 1.0 | April 2026**
 
-HomeLink Radio is a family emergency communications application for licensed amateur radio operators. It monitors multiple radio channels (VarAC, APRS, and Winlink) for check-in messages from a traveling family member and enables the home station operator to send replies, post situation reports, and receive phone notifications — all from a simple web interface.
+HamLink Radio is a family emergency communications application for licensed amateur radio operators. It monitors multiple radio channels (VarAC, APRS, and Winlink) for check-in messages from a traveling family member and enables the home station operator to send replies, post situation reports, and receive phone notifications — all from a simple web interface.
 
 ---
 
@@ -13,7 +13,7 @@ HomeLink Radio is a family emergency communications application for licensed ama
 3. [Installation](#3-installation)
 4. [First Launch](#4-first-launch)
 5. [Configuration Guide](#5-configuration-guide)
-6. [Using HomeLink Radio](#6-using-homelink-radio)
+6. [Using HamLink Radio](#6-using-hamlink-radio)
 7. [Sitrep System](#7-sitrep-system)
 8. [Use Cases](#8-use-cases)
 9. [FCC Compliance](#9-fcc-compliance)
@@ -24,11 +24,11 @@ HomeLink Radio is a family emergency communications application for licensed ama
 
 ## 1. Who Is This For?
 
-HomeLink Radio is designed for two people:
+HamLink Radio is designed for two people:
 
 - **The traveler** — A licensed ham radio operator who is away from home (road trip, backcountry, deployment, disaster response). They send check-in messages from their portable or mobile radio using VarAC, APRS, or Winlink.
 
-- **The home station operator** — A family member at home (spouse, parent, etc.) who may or may not hold a ham license. They use HomeLink Radio's web interface on a PC or phone to monitor for messages, send replies, and post family status reports.
+- **The home station operator** — A family member at home (spouse, parent, etc.) who may or may not hold a ham license. They use HamLink Radio's web interface on a PC or phone to monitor for messages, send replies, and post family status reports.
 
 The licensed operator (the traveler) is ultimately responsible for all transmissions made from the home station, including those initiated through this application. See [FCC Compliance](#9-fcc-compliance) for details.
 
@@ -63,23 +63,23 @@ The licensed operator (the traveler) is ultimately responsible for all transmiss
 
 ## 3. Installation
 
-### Step 1: Download HomeLink Radio
+### Step 1: Download HamLink Radio
 
-Place these files in a folder (e.g., `C:\HomeLink\`):
+Place these files in a folder (e.g., `C:\HamLink\`):
 - `monitor.py` — The application
-- `start_homelink.bat` — Launcher script
-- `build_exe.bat` — Optional build script
+- `start_hamlink.bat` — Launcher script
+- `build_hamlink_exe.bat` — Optional build script
 
 ### Step 2: Run the Launcher
 
-Double-click `start_homelink.bat`. It will:
+Double-click `start_hamlink.bat`. It will:
 
 1. Check that Python 3.8+ is installed
 2. Verify pip is available
 3. Install Flask if not present
 4. Install aprslib if not present
 5. Check for Pat (optional)
-6. Launch HomeLink Radio
+6. Launch HamLink Radio
 
 The launcher displays version information and opens your browser to `http://127.0.0.1:5000`.
 
@@ -93,7 +93,7 @@ If the launcher reports Python is missing:
 
 ### Step 4: Network Access (optional)
 
-To access HomeLink Radio from a phone or tablet on the same Wi-Fi network, use the PC's local IP address instead of `127.0.0.1`. For example: `http://192.168.1.100:5000`.
+To access HamLink Radio from a phone or tablet on the same Wi-Fi network, use the PC's local IP address instead of `127.0.0.1`. For example: `http://192.168.1.100:5000`.
 
 ---
 
@@ -111,7 +111,7 @@ You must check all three boxes and click "I Understand & Accept" to proceed. Thi
 
 ### Welcome Screen
 
-After the compliance notice, a splash screen explains what HomeLink Radio does:
+After the compliance notice, a splash screen explains what HamLink Radio does:
 - Monitors for check-in messages
 - Sends alerts when messages arrive
 - Enables replies and sitrep posting
@@ -147,11 +147,11 @@ Open Settings by clicking the gear icon in the top-right corner. Each section is
 
 | Field | Description |
 |-------|-------------|
-| **VarAC Executable Path** | Full path to `VarAC.exe`. If set, HomeLink auto-launches VarAC on startup. |
+| **VarAC Executable Path** | Full path to `VarAC.exe`. If set, HamLink auto-launches VarAC on startup. |
 | **VarAC Profile** | The `.ini` profile filename (e.g., `VarAC_7300.ini`). Leave blank to use the default `VarAC.ini`. |
 | **BBS Directory Override** | Override the BBS folder path for sitreps. Leave blank to auto-read from the VarAC profile `.ini` file. A green "Resolved" hint shows the detected path. |
 | **VarAC Database Path** | Path to `VarAC.db`. Click "Browse" to find it, then "Test" to verify the connection. |
-| **Check Every (seconds)** | How often HomeLink polls the VarAC database for new messages. Default: 15 seconds. |
+| **Check Every (seconds)** | How often HamLink polls the VarAC database for new messages. Default: 15 seconds. |
 
 ### 5.3 Alert Sound
 
@@ -212,13 +212,13 @@ Periodically transmits your home station's position via APRS so the traveler can
 | **Latitude / Longitude** | Your home station coordinates in decimal degrees. |
 | **Symbol** | APRS map symbol (e.g., House, Antenna, Emergency). |
 | **Interval** | How often to beacon, in minutes. Minimum: 5. Default: 30. |
-| **Comment** | Text shown on the map alongside your beacon (e.g., "HomeLink Radio"). |
+| **Comment** | Text shown on the map alongside your beacon (e.g., "HamLink Radio"). |
 | **Via APRS-IS** | Send beacon over the internet. |
 | **Via RF** | Send beacon over RF (requires Soundmodem). |
 
 ### 5.8 Winlink (via Pat)
 
-Winlink provides email-like messaging over radio. HomeLink uses the Pat client to send and receive Winlink messages.
+Winlink provides email-like messaging over radio. HamLink uses the Pat client to send and receive Winlink messages.
 
 | Field | Description |
 |-------|-------------|
@@ -246,7 +246,7 @@ Enables RF APRS via Soundmodem and the KISS protocol. Required for APRS RF fallb
 
 ---
 
-## 6. Using HomeLink Radio
+## 6. Using HamLink Radio
 
 ### 6.1 The Main Dashboard
 
@@ -268,7 +268,7 @@ The main screen shows:
 
 When the traveler sends a message:
 
-1. HomeLink detects it during the next poll cycle (within seconds for APRS, within the configured interval for VarAC and Winlink)
+1. HamLink detects it during the next poll cycle (within seconds for APRS, within the configured interval for VarAC and Winlink)
 2. The status card turns red and pulses
 3. A sound plays through your PC speakers
 4. A Pushover notification is sent to your phone (if configured)
@@ -319,7 +319,7 @@ A Sitrep (Situation Report) is a structured status update posted to the VarAC BB
 2. A form appears with pre-filled fields (defaults: "All OK" / "No change" / "None")
 3. The operator edits only what has changed
 4. Taps "Post Sitrep" (or "Quick All-OK" for a one-tap all-clear)
-5. HomeLink:
+5. HamLink:
    - Saves the sitrep as a text file in the VarAC BBS folder
    - Renames the previous sitrep to archive it
    - Sends a VarAC broadcast to all stations on the current frequency
@@ -371,7 +371,7 @@ REMARKS:    Tree down on Elm St, roads passable
 
 ### VarAC Broadcast
 
-When a sitrep is posted, HomeLink automatically sends a VarAC broadcast to all stations on the current frequency:
+When a sitrep is posted, HamLink automatically sends a VarAC broadcast to all stations on the current frequency:
 
 ```
 SITREP#005 on BBS QSY 13:30Z 14.105 pls connect & relay
@@ -379,14 +379,14 @@ SITREP#005 on BBS QSY 13:30Z 14.105 pls connect & relay
 
 This broadcast:
 - Reaches all VarAC operators currently on the same frequency
-- Is sent by automating VarAC's own broadcast dialog (HomeLink opens the dialog, fills the TO and MESSAGE fields, and clicks Send — all via window handles, not screen coordinates)
+- Is sent by automating VarAC's own broadcast dialog (HamLink opens the dialog, fills the TO and MESSAGE fields, and clicks Send — all via window handles, not screen coordinates)
 - VarAC must be running and idle (not in a QSO) for the broadcast to transmit immediately; if busy, VarAC queues it
 
 This is the most targeted announcement — it hits exactly the people who are already running VarAC and capable of connecting to your BBS.
 
 ### APRS Bulletin Announcement
 
-In addition to the VarAC broadcast, HomeLink sends an APRS bulletin to reach a wider audience:
+In addition to the VarAC broadcast, HamLink sends an APRS bulletin to reach a wider audience:
 
 ```
 SITREP#003 KK4ODA BBS 7.105MHz QSY 13:30Z 14.105 pls relay
@@ -425,7 +425,7 @@ The sitrep system enables a powerful relay workflow:
 
 **Workflow:**
 1. Traveler sends a VarAC VMail each evening: "Made it to Amarillo, all good, 73"
-2. HomeLink detects the message, plays an alert, and sends a phone notification
+2. HamLink detects the message, plays an alert, and sends a phone notification
 3. Family member taps a quick reply: "Got your message, all is well here!"
 4. Reply queued to VarAC outbox for next contact
 
@@ -482,19 +482,19 @@ The sitrep system enables a powerful relay workflow:
 
 ## 9. FCC Compliance
 
-HomeLink Radio is designed for use by licensed amateur radio operators under FCC Part 97. The following rules are particularly relevant.
+HamLink Radio is designed for use by licensed amateur radio operators under FCC Part 97. The following rules are particularly relevant.
 
 ### 9.1 Control Operator Responsibility (97.7, 97.103)
 
 Every amateur station must have a control operator — the person responsible for the proper operation of the station. The control operator must hold a valid amateur radio license of the appropriate class.
 
-**What this means for HomeLink Radio:** The licensed operator (typically the traveler) is responsible for all transmissions made from the home station, including those initiated through this application by a family member. If the family member does not hold their own amateur license, they are acting as a third party (see 97.115 below) and the licensed operator must ensure compliance.
+**What this means for HamLink Radio:** The licensed operator (typically the traveler) is responsible for all transmissions made from the home station, including those initiated through this application by a family member. If the family member does not hold their own amateur license, they are acting as a third party (see 97.115 below) and the licensed operator must ensure compliance.
 
 ### 9.2 Third-Party Traffic (97.115)
 
 An amateur station may transmit messages on behalf of a third party (a person who is not a licensed amateur) to any station within the jurisdiction of the United States. The control operator must ensure compliance with all rules.
 
-**What this means for HomeLink Radio:** A non-licensed family member may use HomeLink Radio to send replies and sitreps, but:
+**What this means for HamLink Radio:** A non-licensed family member may use HamLink Radio to send replies and sitreps, but:
 - The licensed operator must have authorized this use
 - The licensed operator is responsible for the content of all transmissions
 - All messages must comply with FCC content rules
@@ -504,10 +504,10 @@ An amateur station may transmit messages on behalf of a third party (a person wh
 
 Each amateur station must transmit its assigned call sign at the end of each communication and at least every 10 minutes during a communication. Identification may be by CW, phone (voice in English), RTTY, or data emission.
 
-**What this means for HomeLink Radio:**
+**What this means for HamLink Radio:**
 - VarAC and APRS messages automatically include the station callsign in the packet header
 - APRS beacons include the callsign
-- The home callsign configured in HomeLink settings is used for all transmissions
+- The home callsign configured in HamLink settings is used for all transmissions
 - Digital modes (VARA, APRS) satisfy the identification requirement through the data protocol
 
 ### 9.4 Prohibited Transmissions (97.113)
@@ -520,7 +520,7 @@ Amateur stations must not transmit:
 - Encoded messages intended to obscure meaning (except for certain control signals)
 - Broadcasting (one-way transmissions to the general public)
 
-**What this means for HomeLink Radio:**
+**What this means for HamLink Radio:**
 - All messages must be personal, non-commercial family communications
 - No encryption is used — all messages are transmitted in the clear
 - Sitreps and APRS bulletins are addressed to specific parties or the amateur community, not the general public
@@ -530,7 +530,7 @@ Amateur stations must not transmit:
 
 Automatic control is permitted for digital stations on certain frequencies. The control operator does not need to be physically present at the control point, but must ensure compliance with all rules.
 
-**What this means for HomeLink Radio:**
+**What this means for HamLink Radio:**
 - APRS beacons are transmitted automatically at configured intervals — this is standard practice and permitted on APRS frequencies
 - APRS bulletins and message replies are initiated by a human operator (the family member) through the web interface, not automatically triggered
 - VarAC BBS serves files to connecting stations — the BBS operates under VarAC's own automatic control provisions
@@ -540,7 +540,7 @@ Automatic control is permitted for digital stations on certain frequencies. The 
 
 An amateur station may use any means of radio communications at its disposal to provide essential communication needs in connection with the immediate safety of human life and the immediate protection of property when normal communication systems are not functioning.
 
-**What this means for HomeLink Radio:** During a declared emergency or disaster:
+**What this means for HamLink Radio:** During a declared emergency or disaster:
 - Normal operating restrictions may be relaxed when necessary for life safety
 - The sitrep system is designed for exactly this purpose — communicating family welfare status during emergencies
 - RF fallback (Soundmodem, VARA FM) ensures communications continue when internet infrastructure fails
@@ -548,7 +548,7 @@ An amateur station may use any means of radio communications at its disposal to 
 
 ### 9.7 Content Guidelines for Family Members
 
-If a non-licensed family member will be using HomeLink Radio, the licensed operator should brief them on these rules:
+If a non-licensed family member will be using HamLink Radio, the licensed operator should brief them on these rules:
 
 1. **Keep it personal** — Messages should be family communications, not commercial or business content
 2. **Keep it clean** — No obscene, indecent, or profane language
@@ -597,7 +597,7 @@ If the traveler is operating from outside the United States:
 | Symptom | Solution |
 |---------|----------|
 | Test notification not received | Verify both User Key and API Token are correct. Check your Pushover app is installed and logged in. |
-| Quick reply links not working | Ensure HomeLink Radio is running and accessible when you tap the link. |
+| Quick reply links not working | Ensure HamLink Radio is running and accessible when you tap the link. |
 
 ### Winlink / Pat Issues
 
@@ -619,7 +619,7 @@ If the traveler is operating from outside the United States:
 
 ## 11. Building a Standalone EXE
 
-You can build HomeLink Radio as a single `.exe` file that runs without a Python installation.
+You can build HamLink Radio as a single `.exe` file that runs without a Python installation.
 
 ### Prerequisites
 
@@ -630,17 +630,17 @@ pip install pyinstaller
 
 ### Build
 
-Double-click `build_exe.bat` or run:
+Double-click `build_hamlink_exe.bat` or run:
 ```
-pyinstaller --onefile --name HomeLink_Radio monitor.py
+pyinstaller --onefile --name HamLink_Radio monitor.py
 ```
 
-The executable will be created at `dist\HomeLink_Radio.exe`.
+The executable will be created at `dist\HamLink_Radio.exe`.
 
 ### Distribution
 
-To distribute HomeLink Radio to another computer:
-1. Copy `HomeLink_Radio.exe` to the target machine
+To distribute HamLink Radio to another computer:
+1. Copy `HamLink_Radio.exe` to the target machine
 2. Run it — a `config.json` will be created on first launch
 3. Configure Settings through the web interface
 4. VarAC and other external programs must still be installed separately
@@ -649,8 +649,8 @@ To distribute HomeLink Radio to another computer:
 
 ## License and Disclaimer
 
-HomeLink Radio is open-source software provided as-is, without warranty. The licensed amateur radio operator is solely responsible for all transmissions made from their station, including those initiated through this application. This software does not constitute legal advice regarding FCC regulations. Consult the [ARRL](http://www.arrl.org) or the [FCC](https://www.fcc.gov/wireless/bureau-divisions/mobility-division/amateur-radio-service) for authoritative guidance on amateur radio rules.
+HamLink Radio is open-source software provided as-is, without warranty. The licensed amateur radio operator is solely responsible for all transmissions made from their station, including those initiated through this application. This software does not constitute legal advice regarding FCC regulations. Consult the [ARRL](http://www.arrl.org) or the [FCC](https://www.fcc.gov/wireless/bureau-divisions/mobility-division/amateur-radio-service) for authoritative guidance on amateur radio rules.
 
 ---
 
-*73 de KK4ODA — HomeLink Radio*
+*73 de KK4ODA — HamLink Radio*

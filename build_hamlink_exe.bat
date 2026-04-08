@@ -1,10 +1,10 @@
 @echo off
-title HomeLink Radio — Build Standalone EXE
+title HamLink Radio — Build Standalone EXE
 color 0A
 
 echo.
 echo  ╔══════════════════════════════════════════╗
-echo  ║  HomeLink Radio — Build Standalone   ║
+echo  ║  HamLink Radio — Build Standalone   ║
 echo  ║  Creates a single .exe file              ║
 echo  ╚══════════════════════════════════════════╝
 echo.
@@ -64,7 +64,7 @@ cd /d "%~dp0"
 
 python -m PyInstaller ^
     --onefile ^
-    --name "HomeLink_Radio" ^
+    --name "HamLink_Radio" ^
     --icon NONE ^
     --hidden-import=flask ^
     --hidden-import=sqlite3 ^
@@ -94,10 +94,10 @@ echo  ║  Build complete!                         ║
 echo  ╚══════════════════════════════════════════╝
 echo.
 echo  Your standalone executable is at:
-echo    dist\HomeLink_Radio.exe
+echo    dist\HamLink_Radio.exe
 echo.
 echo  To deploy:
-echo    1. Copy HomeLink_Radio.exe to any folder
+echo    1. Copy HamLink_Radio.exe to any folder
 echo    2. Double-click to run (no Python needed!)
 echo    3. A config.json will be created on first run
 echo    4. Open http://127.0.0.1:5000 in your browser

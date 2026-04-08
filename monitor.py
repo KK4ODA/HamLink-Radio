@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-HomeLink Radio — Family Edition
+HamLink Radio — Family Edition
 -------------------------------------
 A friendly web app for family members to see check-in messages
 from a traveling ham operator, and reply back via VarAC VMail.
@@ -32,7 +32,7 @@ def _beep_system():
                 time.sleep(0.05)
         elif sys.platform == "darwin":
             # macOS: use system sound via osascript
-            os.system('osascript -e \'display notification "New message!" with title "HomeLink Radio" sound name "Submarine"\'')
+            os.system('osascript -e \'display notification "New message!" with title "HamLink Radio" sound name "Submarine"\'')
             os.system("afplay /System/Library/Sounds/Ping.aiff &")
         else:
             # Linux: try multiple approaches
@@ -149,7 +149,7 @@ DEFAULT_CONFIG = {
             "varafm_exe_path": ""},
     "beacon": {"enabled": False, "lat": 0.0, "lon": 0.0,
                "symbol_table": "/", "symbol_code": "-",
-               "comment": "HomeLink Radio", "interval_minutes": 30,
+               "comment": "HamLink Radio", "interval_minutes": 30,
                "via_aprsis": True, "via_rf": True},
     "web_port": 5000,
     "alert_sound": "gentle",
@@ -197,7 +197,7 @@ cfglock = threading.Lock()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s",
                     handlers=[logging.StreamHandler(sys.stdout)])
-log = logging.getLogger("homelink-radio")
+log = logging.getLogger("hamlink-radio")
 
 # ---------------------------------------------------------------------------
 # State
@@ -814,7 +814,7 @@ def _read_varac_ini(ini_path):
 
 
 def get_bbs_directory():
-    """Return the BBS directory path. Priority: HomeLink config override > VarAC .ini > None."""
+    """Return the BBS directory path. Priority: HamLink config override > VarAC .ini > None."""
     with cfglock:
         override = config.get("bbs_directory", "").strip()
     if override:
@@ -1820,7 +1820,7 @@ def _build_beacon_packet():
     home = base + ssid if ssid and not base.endswith(ssid) else base
     sym_table = bcn.get("symbol_table", "/")
     sym_code = bcn.get("symbol_code", "-")
-    comment = bcn.get("comment", "HomeLink Radio")
+    comment = bcn.get("comment", "HamLink Radio")
     lat_str = _lat_to_aprs(lat)
     lon_str = _lon_to_aprs(lon)
     # APRS position format: !DDMM.MMN/DDDMM.MME-comment
@@ -2285,7 +2285,7 @@ def api_status():
                 "lon": config.get("beacon", {}).get("lon", 0),
                 "symbol_table": config.get("beacon", {}).get("symbol_table", "/"),
                 "symbol_code": config.get("beacon", {}).get("symbol_code", "-"),
-                "comment": config.get("beacon", {}).get("comment", "HomeLink Radio"),
+                "comment": config.get("beacon", {}).get("comment", "HamLink Radio"),
                 "interval_minutes": config.get("beacon", {}).get("interval_minutes", 30),
                 "via_aprsis": config.get("beacon", {}).get("via_aprsis", True),
                 "via_rf": config.get("beacon", {}).get("via_rf", True),
@@ -2457,7 +2457,7 @@ def api_pat_config_set():
             if tac not in existing:
                 existing.append(tac)
             pcfg["auxiliary_addresses"] = existing
-    # Clear Pat's internal schedule — HomeLink controls sync timing now
+    # Clear Pat's internal schedule — HamLink controls sync timing now
     pcfg.pop("schedule", None)
     if "varafm_addr" in d and d["varafm_addr"]:
         if "varafm" not in pcfg:
@@ -2927,7 +2927,7 @@ def api_test_pushover():
         return jsonify({"ok": False, "error": "User key and API token required"})
     try:
         import urllib.request, urllib.parse
-        p = {"token": at, "user": uk, "title": "HomeLink Radio",
+        p = {"token": at, "user": uk, "title": "HamLink Radio",
              "message": "Notifications are working!", "priority": 0, "sound": "pushover"}
         data = urllib.parse.urlencode(p).encode()
         r = urllib.request.Request("https://api.pushover.net/1/messages.json", data=data)
@@ -3008,7 +3008,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>HomeLink Radio</title>
+<title>HamLink Radio</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
@@ -3351,7 +3351,7 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
 <div class="splash hidden" id="splash">
   <div class="splash-inner">
     <div class="icon">📡</div>
-    <h2>HomeLink Radio</h2>
+    <h2>HamLink Radio</h2>
     <p>This app watches for check-in messages from your loved one (who is traveling) sent to this home radio. You'll get alerts when they check in, and you can send replies and post sitreps.</p>
     <button class="btn-start" onclick="start()">Start</button>
   </div>
@@ -3504,7 +3504,7 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
           <input class="fi" id="cBcnInterval" type="number" min="5" max="120" value="30" style="width:100px">
           <div class="fhint">How often to transmit your position (5-120 minutes). 30 is typical for a fixed station.</div></div>
         <div class="fg"><label class="fl">Beacon Comment</label>
-          <input class="fi" id="cBcnComment" placeholder="HomeLink Radio" style="width:250px">
+          <input class="fi" id="cBcnComment" placeholder="HamLink Radio" style="width:250px">
           <div class="fhint">Short text appended to your beacon (visible on APRS maps)</div></div>
         <div class="fg"><div class="tgl-row"><label class="fl" style="margin:0">Beacon via APRS-IS (internet)</label>
           <div class="tgl" id="cBcnAprsIs" onclick="this.classList.toggle('on')"></div></div></div>
@@ -3633,7 +3633,7 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
 <div class="header">
   <div class="header-left">
     <div class="logo">📡</div>
-    <div><h1>HomeLink Radio</h1><div class="sub" id="headerSub">Waiting for messages...</div></div>
+    <div><h1>HamLink Radio</h1><div class="sub" id="headerSub">Waiting for messages...</div></div>
   </div>
   <button class="btn-gear" onclick="openSett()">⚙</button>
 </div>
@@ -3743,13 +3743,13 @@ function toggleCheck(n){
 }
 function acceptCompliance(){
   if(!compChecked[1]||!compChecked[2]||!compChecked[3])return;
-  try{localStorage.setItem('homelink_compliance_accepted','1')}catch(e){}
+  try{localStorage.setItem('hamlink_compliance_accepted','1')}catch(e){}
   document.getElementById('complianceScreen').classList.add('hidden');
   document.getElementById('splash').classList.remove('hidden');
 }
 function initCompliance(){
   let accepted=false;
-  try{accepted=localStorage.getItem('homelink_compliance_accepted')==='1'}catch(e){}
+  try{accepted=localStorage.getItem('hamlink_compliance_accepted')==='1'}catch(e){}
   if(accepted){
     document.getElementById('complianceScreen').classList.add('hidden');
     document.getElementById('splash').classList.remove('hidden');
@@ -4056,7 +4056,7 @@ async function fillForm(){
   var symSel=document.getElementById('cBcnSymbol');
   for(var i=0;i<symSel.options.length;i++){if(symSel.options[i].value===symVal){symSel.selectedIndex=i;break}}
   document.getElementById('cBcnInterval').value=bcn.interval_minutes||30;
-  document.getElementById('cBcnComment').value=bcn.comment||'HomeLink Radio';
+  document.getElementById('cBcnComment').value=bcn.comment||'HamLink Radio';
   document.getElementById('cBcnAprsIs').classList.toggle('on',bcn.via_aprsis!==false);
   document.getElementById('cBcnRf').classList.toggle('on',bcn.via_rf!==false);
   const sm=c.soundmodem||{};
@@ -4115,7 +4115,7 @@ async function saveSett(){
       lon:parseFloat(document.getElementById('cBcnLon').value)||0,
       symbol_table:document.getElementById('cBcnSymbol').value.charAt(0),
       symbol_code:document.getElementById('cBcnSymbol').value.charAt(1),
-      comment:document.getElementById('cBcnComment').value.trim()||'HomeLink Radio',
+      comment:document.getElementById('cBcnComment').value.trim()||'HamLink Radio',
       interval_minutes:parseInt(document.getElementById('cBcnInterval').value)||30,
       via_aprsis:document.getElementById('cBcnAprsIs').classList.contains('on'),
       via_rf:document.getElementById('cBcnRf').classList.contains('on'),
@@ -4598,7 +4598,7 @@ async function loadLog(){
 if __name__ == "__main__":
     _init_log_file()
     port = config.get("web_port", 5000)
-    log.info("HomeLink Radio starting on port %d", port)
+    log.info("HamLink Radio starting on port %d", port)
     log.info("Open http://127.0.0.1:%d", port)
 
     # Check if port is already in use (previous instance still running?)
@@ -4608,7 +4608,7 @@ if __name__ == "__main__":
         _test.settimeout(1)
         _test.connect(("127.0.0.1", port))
         _test.close()
-        log.error("Port %d is already in use! Is another instance of HomeLink Radio running?", port)
+        log.error("Port %d is already in use! Is another instance of HamLink Radio running?", port)
         log.error("Stop the other instance first, or change web_port in config.json")
         sys.exit(1)
     except (ConnectionRefusedError, OSError, _sock.timeout):
@@ -4640,9 +4640,9 @@ if __name__ == "__main__":
             try:
                 pcfg = _pat_read_config()
                 dirty = False
-                # Clear Pat's internal schedule — HomeLink controls sync timing
+                # Clear Pat's internal schedule — HamLink controls sync timing
                 if pcfg.get("schedule"):
-                    log.info("Clearing Pat's internal schedule — HomeLink handles sync timing")
+                    log.info("Clearing Pat's internal schedule — HamLink handles sync timing")
                     pcfg.pop("schedule", None)
                     dirty = True
                 # Fix auxiliary_addresses: must be strings, not objects

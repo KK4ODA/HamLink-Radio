@@ -1,4 +1,4 @@
-# HomeLink Radio
+# HamLink Radio
 
 A friendly web app that lets your family know when you've checked in via ham radio. Your wife (or any family member) sees a simple, jargon-free dashboard on her phone or the home PC — no ham radio knowledge needed.
 

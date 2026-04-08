@@ -20,7 +20,7 @@ A clear description of the bug.
 
 
 **Your setup:**
-- HomeLink Radio version:
+- HamLink Radio version:
 - VarAC version:
 - Windows version:
 - Python version (if not using .exe):
