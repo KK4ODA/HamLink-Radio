@@ -1,53 +1,67 @@
 # HamLink Radio
 
-A friendly web app that lets your family know when you've checked in via ham radio. Your wife (or any family member) sees a simple, jargon-free dashboard on her phone or the home PC — no ham radio knowledge needed.
+A family emergency communications app for licensed amateur radio operators. HamLink monitors VarAC, APRS, and Winlink for check-in messages from a traveling loved one and lets the family at home send replies, post situation reports, and receive phone notifications — all from a simple web interface.
 
-## What It Does
+No ham radio knowledge needed on the home end.
 
-- **Shows a clear "checked in" status** when you send a VMail from the field
-- **Alerts with sound and phone notifications** so she knows immediately
-- **Displays your messages** with your name instead of callsigns — no SNR, no bands, no jargon
-- **Let's he/she reply** by typing a message or tapping a pre-written quick reply — the reply is queued as a VMail in VarAC's outbox
-- **Monitors relay notifications** so she knows if a parked message is waiting
-- **Works on his/her phone** — fully mobile-responsive, accessible from any browser on the local network
+## Features
+
+- **Multi-channel monitoring** — VarAC VMail, APRS (internet + RF), and Winlink/Pat
+- **Sitrep system** — Post structured family status reports to the VarAC BBS with one tap
+- **VarAC broadcast** — Automatically announces sitreps to all VarAC stations on frequency
+- **APRS bulletins** — Announces sitreps with current frequency and next QSY time
+- **Phone notifications** — Pushover alerts with optional quick reply links (with confirmation)
+- **RF fallback** — APRS via Soundmodem and Winlink via VARA FM gateway when internet is down
+- **Position tracking** — APRS beacons and last-known position display
+- **FCC compliance safeguards** — RF transmission warnings with Part 97 citations and emergency exception language; channel labels show internet vs RF path
+- **Message logging** — Persistent CSV log of all incoming and outgoing messages
+- **Simple web UI** — Designed for non-technical family members; works on PC or phone
 
 ## Quick Start
 
-1. `pip install flask`
-2. `python monitor.py` (or double-click `start_monitor.bat` on Windows)
-3. Open `http://127.0.0.1:5000` on the PC, or `http://<pc-ip>:5000` on her phone
-4. Click **Start**, then open **Settings** (gear icon) to configure:
-   - **Their Name** — your name, shown in alerts instead of callsigns
-   - **Home Station Callsign** — used as the "from" address on her replies
-   - **Watch Callsign(s)** — your traveling callsign(s) to monitor
-   - **Database path** — browse to VarAC.db
-   - **Quick Replies** — pre-written messages she can send with one tap
-   - **Alert sound** — 6 options with volume control and preview
-   - **Pushover** — phone push notifications
+1. Double-click `start_hamlink.bat` (installs dependencies automatically)
+2. Open `http://127.0.0.1:5000` in your browser
+3. Accept the regulatory compliance notice
+4. Click the gear icon and configure:
+   - **Their Name** and **Home Station Callsign**
+   - **Watch Callsigns** — the traveler's callsign(s)
+   - **VarAC Database Path** — browse to `VarAC.db`
+   - Enable APRS, Winlink, Pushover as needed
 
-## How Replies Work
+See [MANUAL.md](MANUAL.md) for complete documentation including all configuration options, use cases, and FCC compliance guide.
 
-When your significant other taps a quick reply or types a message and hits **Send Reply**, the app inserts a new VMail into VarAC's outbox. VarAC will send it on the next connection with your remote station.
+## How It Works
 
-**Important:** The home VarAC station must be running and connected to VARA modem for replies to be transmitted. The app queues the reply — VarAC handles the actual radio transmission.
+**Receiving:** HamLink polls the VarAC database, listens on APRS-IS and RF, and checks the Winlink inbox. When a message arrives from a watched callsign, it plays an alert sound, shows the message on screen, and sends a phone notification.
 
-## Setup for Your Significant Other
+**Sending:** The family member types a reply or taps a quick reply. Messages can be sent via APRS (internet or RF), Winlink (internet or RF gateway), or VarAC VMail. The UI clearly labels each channel as **(internet)** or **(RF)**, and RF transmissions require a confirmation step with FCC Part 97 compliance language.
 
-After initial configuration:
-1. Bookmark `http://<pc-ip>:5000` on her phone
-2. She/He clicks **Start** and allows notifications
-3. When you send a VMail from the field, she/he sees your name and message with a chime
-4. She/He taps **Got it** to acknowledge, or **Reply** to send a message back
-5. Pushover sends a notification to her/his phone even if the browser tab is closed
+**Sitreps:** The family member posts a structured status report (house, vehicles, utilities, health, needs, relocation) to the VarAC BBS. HamLink automatically sends a VarAC broadcast and APRS bulletin so nearby hams can connect to the BBS and relay the information to the traveler.
 
 ## Files
 
-- `monitor.py` — the app (Flask backend + embedded frontend)
-- `config.json` — auto-saved settings (edited via the GUI)
-- `start_monitor.bat` — Windows launcher with dependency checking
+| File | Description |
+|------|-------------|
+| `monitor.py` | The application (Flask backend + embedded frontend) |
+| `start_hamlink.bat` | Windows launcher with dependency checking |
+| `build_hamlink_exe.bat` | Build standalone .exe via PyInstaller |
+| `config.json` | Auto-saved settings (created on first run, not tracked in git) |
+| `MANUAL.md` | Complete user manual with FCC compliance guide |
 
 ## Requirements
 
-- Python 3.8+ with Flask
-- VarAC V5+ running on the same machine
-- A web browser (any modern browser on PC or phone)
+- Python 3.8+ (or standalone .exe)
+- VarAC V5+ with VARA HF modem
+- Optional: Pat (Winlink), Soundmodem (RF APRS), VARA FM (RF Winlink), Pushover account
+
+## FCC Compliance
+
+HamLink is designed for use by licensed amateur radio operators under FCC Part 97. The licensed operator is responsible for all transmissions from the station. RF transmissions initiated through the app require a confirmation step citing Part 97.115 (third-party traffic) and Part 97.403 (emergency exception). See the [FCC Compliance section](MANUAL.md#9-fcc-compliance) in the manual for details.
+
+## Contributing
+
+Bugs and feature requests: [GitHub Issues](https://github.com/KK4ODA/HamLink-Radio/issues)
+
+## License
+
+Open source. 73 de KK4ODA.

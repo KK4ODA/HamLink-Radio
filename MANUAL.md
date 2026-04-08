@@ -290,17 +290,29 @@ Click "Send Message" or "Reply" on any alert. The compose box opens with:
 - **Quick Reply Buttons** — Your pre-written replies (one tap to select)
 - **Text Area** — Type a custom message
 - **Channel Checkboxes** — Select which channels to send via:
-  - **APRS** — Short messages up to 67 characters (fastest delivery)
-  - **Winlink** — Full email messages (reliable, store-and-forward)
-  - **VarAC** — Peer-to-peer digital messages (requires direct connection)
+  - **APRS (internet)** or **APRS (RF)** — Short messages up to 67 characters. The label dynamically shows whether the message will go via APRS-IS (internet) or Soundmodem (RF), depending on your current connection state.
+  - **Winlink (internet)** or **Winlink (internet / RF fallback)** — Full email messages. Shows RF fallback status if configured.
+  - **VarAC (RF)** — Always an RF transmission via peer-to-peer digital link.
 
-You can select multiple channels to maximize delivery chances. Click "Send" to transmit.
+Channels that involve RF transmission are labeled in amber. You can select multiple channels to maximize delivery chances.
+
+**RF transmission confirmation:** If any selected channel involves an RF transmission (VarAC, APRS via Soundmodem), a confirmation dialog appears before sending. This dialog cites:
+- **FCC Part 97.115** — Third-party traffic requires a licensed control operator
+- **FCC Part 97.403** — Emergency exception: in situations involving immediate safety of life or property, any means of communication may be used
+
+Messages sent via internet-only channels (APRS-IS, Winlink telnet) do not trigger the RF confirmation, as they do not involve amateur radio transmissions from your station.
 
 **APRS length warning:** If your message exceeds 67 characters, a red warning appears. APRS messages are truncated at 67 characters.
 
 ### 6.4 Quick Replies from Your Phone
 
-If Pushover quick replies are enabled in Settings, incoming message notifications on your phone include clickable reply links. Tapping a link opens a confirmation page with a licensing reminder — a second tap is required to actually transmit. This prevents accidental transmissions.
+If Pushover quick replies are enabled in Settings (off by default), incoming message notifications on your phone include clickable reply links. Tapping a link opens a confirmation page showing:
+- The message that will be sent
+- A reminder that amateur radio transmissions require a valid license (FCC Part 97.115)
+- An emergency exception notice (FCC Part 97.403)
+- A "Confirm & Send" button — a second tap is required to actually transmit
+
+This two-step process prevents accidental transmissions.
 
 ### 6.5 Message Log
 
@@ -534,7 +546,10 @@ Automatic control is permitted for digital stations on certain frequencies. The 
 **What this means for HamLink Radio:**
 - APRS beacons are transmitted automatically at configured intervals — this is standard practice and permitted on APRS frequencies
 - APRS bulletins and message replies are initiated by a human operator (the family member) through the web interface, not automatically triggered
-- Pushover quick reply links (when enabled) require a two-step confirmation before transmitting, with a licensing reminder displayed on the confirmation page
+- The compose box clearly labels each channel as **(internet)** or **(RF)** so the operator knows which path involves a radio transmission
+- RF transmissions (VarAC, APRS via Soundmodem) require a confirmation step citing FCC Part 97.115 and 97.403 before the message is sent
+- Internet-only transmissions (APRS-IS, Winlink telnet) do not trigger the RF confirmation since they do not involve amateur radio transmissions from the home station
+- Pushover quick reply links (when enabled) require a two-step confirmation before transmitting, with licensing and emergency exception language displayed
 - VarAC BBS serves files to connecting stations — the BBS operates under VarAC's own automatic control provisions
 - The control operator should be reachable and able to shut down the station if needed
 
