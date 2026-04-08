@@ -2380,7 +2380,10 @@ def api_pushover_reply():
       <div class="warn">
         All amateur radio transmissions are made under the authority of the station license.
         Only licensed amateur radio operators or authorized third parties under the direct
-        supervision of a licensed operator may initiate transmissions (FCC Part 97).
+        supervision of a licensed control operator may initiate transmissions (FCC Part 97.115).
+        <br><br>
+        <strong>Emergency exception:</strong> In situations involving the immediate safety of human
+        life or protection of property, any means of radio communication may be used (FCC Part 97.403).
       </div>
       <form method="POST" action="/api/pushover_reply_send">
         <input type="hidden" name="channel" value="{safe_channel}">
@@ -3743,16 +3746,37 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
     <div style="margin-top:10px;font-size:12px;color:var(--text2)">
       <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center">
         <label style="cursor:pointer;display:flex;align-items:center;gap:4px" id="chkAprsLabel">
-          <input type="checkbox" id="chkAprs" checked> APRS <span style="color:var(--text3)">(short message)</span></label>
+          <input type="checkbox" id="chkAprs" checked> APRS <span style="color:var(--text3)" id="aprsPathLabel">(internet)</span></label>
         <label style="cursor:pointer;display:flex;align-items:center;gap:4px" id="chkWinlinkLabel">
-          <input type="checkbox" id="chkWinlink" checked> Winlink <span style="color:var(--text3)">(radio email)</span></label>
+          <input type="checkbox" id="chkWinlink" checked> Winlink <span style="color:var(--text3)" id="wlPathLabel">(internet)</span></label>
         <label style="cursor:pointer;display:flex;align-items:center;gap:4px" id="chkVaracLabel">
-          <input type="checkbox" id="chkVarac" checked> VarAC <span style="color:var(--text3)">(peer to peer)</span></label>
+          <input type="checkbox" id="chkVarac" checked> VarAC <span style="color:var(--text3)" id="varacPathLabel">(RF — peer to peer)</span></label>
       </div>
+    </div>
+    <div id="rfWarning" style="display:none;background:#fef3c7;border:1px solid #f59e0b;border-radius:8px;padding:10px;font-size:12px;color:#92400e;margin-top:10px">
+      <strong>RF Transmission:</strong> One or more selected channels will transmit over radio.
+      Only licensed amateur radio operators or authorized third parties under direct supervision
+      may initiate RF transmissions (FCC Part 97).
+      In an emergency involving immediate safety of life or property, any means of communication
+      may be used (97.403).
     </div>
     <div class="reply-send-row">
       <div class="reply-status" id="replyStatus"></div>
-      <button class="btn-send" id="sendBtn" onclick="sendMulti()">Send</button>
+      <button class="btn-send" id="sendBtn" onclick="confirmAndSend()">Send</button>
+    </div>
+  </div>
+
+  <!-- RF CONFIRMATION MODAL -->
+  <div id="rfConfirmModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.4);z-index:400;align-items:center;justify-content:center">
+    <div style="background:#fff;border-radius:14px;padding:24px;max-width:420px;margin:20px;box-shadow:0 4px 20px rgba(0,0,0,.15)">
+      <h3 style="font-size:18px;margin-bottom:12px">Confirm RF Transmission</h3>
+      <p style="font-size:14px;color:#475569;line-height:1.5">Your message will be transmitted over amateur radio (RF). All amateur radio transmissions are made under the authority of the station license.</p>
+      <p style="font-size:13px;color:#475569;line-height:1.5;margin-top:8px">Only licensed amateur radio operators or authorized third parties under the direct supervision of a licensed control operator may initiate transmissions (FCC Part 97.115).</p>
+      <p style="font-size:13px;color:#475569;line-height:1.5;margin-top:8px">In an emergency involving the immediate safety of human life or protection of property, any means of radio communication may be used (FCC Part 97.403).</p>
+      <div style="display:flex;gap:10px;margin-top:16px">
+        <button onclick="cancelRfSend()" style="flex:1;padding:12px;border-radius:10px;border:none;background:#e2e8f0;color:#64748b;font-size:14px;font-weight:600;cursor:pointer">Cancel</button>
+        <button onclick="proceedRfSend()" style="flex:1;padding:12px;border-radius:10px;border:none;background:#16a34a;color:#fff;font-size:14px;font-weight:700;cursor:pointer">Confirm &amp; Send</button>
+      </div>
     </div>
   </div>
 
@@ -3858,8 +3882,28 @@ function _openComposeBox(chan){
   if(!aprsOn)document.getElementById('chkAprs').checked=false;
   if(!wlOn)document.getElementById('chkWinlink').checked=false;
   if(!varacOn)document.getElementById('chkVarac').checked=false;
+  // Update path labels (internet vs RF)
+  var aprsRf=d.config&&d.config.aprs&&d.config.aprs.rf_fallback&&d.kiss_connected&&!d.aprs_connected;
+  var aprsKiss=d.kiss_connected&&!d.aprs_connected;
+  document.getElementById('aprsPathLabel').textContent=aprsRf||aprsKiss?'(RF)':'(internet)';
+  document.getElementById('aprsPathLabel').style.color=aprsRf||aprsKiss?'#b45309':'var(--text3)';
+  var wlRf=d.config&&d.config.pat&&d.config.pat.rf_fallback;
+  document.getElementById('wlPathLabel').textContent=wlRf?'(internet / RF fallback)':'(internet)';
+  document.getElementById('wlPathLabel').style.color=wlRf?'#b45309':'var(--text3)';
+  document.getElementById('varacPathLabel').textContent='(RF)';
+  document.getElementById('varacPathLabel').style.color='#b45309';
+  // Show RF warning and update on checkbox change
+  function updateRfWarning(){
+    var anyRf=false;
+    if(document.getElementById('chkVarac').checked)anyRf=true;
+    if(document.getElementById('chkAprs').checked&&(aprsRf||aprsKiss))anyRf=true;
+    document.getElementById('rfWarning').style.display=anyRf?'block':'none';
+  }
+  updateRfWarning();
+  document.getElementById('chkAprs').onchange=function(){if(!this.checked)aprsManualUncheck=true;else aprsManualUncheck=false;updateRfWarning()};
+  document.getElementById('chkWinlink').onchange=updateRfWarning;
+  document.getElementById('chkVarac').onchange=updateRfWarning;
   // Manual uncheck listener for APRS
-  document.getElementById('chkAprs').onchange=function(){if(!this.checked)aprsManualUncheck=true;else aprsManualUncheck=false};
   document.getElementById('replyBox').classList.remove('hidden');
   // Quick replies
   var qb=document.getElementById('quickBtns');
@@ -3887,6 +3931,22 @@ function onComposeInput(){
     if(!aprsOn)chk.checked=false;
   }
 }
+
+function confirmAndSend(){
+  // Check if any selected channel involves RF
+  var d=window._d||{};
+  var aprsRf=d.kiss_connected&&!d.aprs_connected;
+  var anyRf=false;
+  if(document.getElementById('chkVarac').checked)anyRf=true;
+  if(document.getElementById('chkAprs').checked&&aprsRf)anyRf=true;
+  if(anyRf){
+    document.getElementById('rfConfirmModal').style.display='flex';
+  }else{
+    sendMulti();
+  }
+}
+function cancelRfSend(){document.getElementById('rfConfirmModal').style.display='none'}
+function proceedRfSend(){document.getElementById('rfConfirmModal').style.display='none';sendMulti()}
 
 async function sendMulti(){
   var msg=document.getElementById('replyText').value.trim();
