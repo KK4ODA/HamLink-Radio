@@ -1,6 +1,6 @@
 # HamLink Radio
 
-A family emergency communications app for licensed amateur radio operators. HamLink monitors VarAC, APRS, and Winlink for check-in messages from a traveling loved one and lets the family at home send replies, post situation reports, and receive phone notifications — all from a simple web interface.
+A family emergency communications app for licensed amateur radio operators. HamLink monitors VarAC, APRS, and Winlink for check-in messages from a traveling loved one and lets the family at home send replies via the internet, post situation reports for pickup or relay, and receive phone notifications via the internet — all from a simple web interface.
 
 No ham radio knowledge needed on the home end.
 
@@ -9,11 +9,10 @@ No ham radio knowledge needed on the home end.
 - **Multi-channel monitoring** — VarAC VMail, APRS (internet + RF), and Winlink/Pat
 - **Sitrep system** — Post structured family status reports to the VarAC BBS with one tap
 - **VarAC broadcast** — Automatically announces sitreps to all VarAC stations on frequency
-- **APRS bulletins** — Announces sitreps with current frequency and next QSY time
 - **Phone notifications** — Pushover alerts with optional quick reply links (with confirmation)
-- **RF fallback** — APRS via Soundmodem and Winlink via VARA FM gateway when internet is down
+- **RF fallback** — APRS via Soundmodem and Winlink via VARA FM gateway when internet is down. RF fallback is blocked by default and requires a licensed operator present, or an emergency involving immediate safety of life or property (FCC Part 97.403)
 - **Position tracking** — APRS beacons and last-known position display
-- **FCC compliance safeguards** — RF transmission warnings with Part 97 citations and emergency exception language; channel labels show internet vs RF path
+- **FCC compliance safeguards** — Non-compliant RF transmissions (exceeding 500 Hz bandwidth) are blocked by default under FCC Part 97.221; channel labels show internet vs RF path; all RF actions require explicit override
 - **Message logging** — Persistent CSV log of all incoming and outgoing messages
 - **Simple web UI** — Designed for non-technical family members; works on PC or phone
 
@@ -34,9 +33,9 @@ See [MANUAL.md](MANUAL.md) for complete documentation including all configuratio
 
 **Receiving:** HamLink polls the VarAC database, listens on APRS-IS and RF, and checks the Winlink inbox. When a message arrives from a watched callsign, it plays an alert sound, shows the message on screen, and sends a phone notification.
 
-**Sending:** The family member types a reply or taps a quick reply. Messages can be sent via APRS (internet or RF), Winlink (internet or RF gateway), or VarAC VMail. The UI clearly labels each channel as **(internet)** or **(RF)**, and RF transmissions require a confirmation step with FCC Part 97 compliance language.
+**Sending:** The family member types a reply or taps a quick reply. By default, replies go via internet: APRS-IS, Winlink telnet, or VarAC outbox (queued for pickup). If internet is down, RF fallback (APRS via Soundmodem, Winlink via VARA FM) is available but blocked by default — it requires the operator to confirm they are a licensed amateur radio operator, or to invoke the emergency exception for immediate safety of life or property (FCC Part 97.403). Data transmissions at 500 Hz bandwidth or below (VARA HF 500 Hz) are compliant under automatic control (FCC Part 97.221).
 
-**Sitreps:** The family member posts a structured status report (house, vehicles, utilities, health, needs, relocation) to the VarAC BBS. HamLink automatically sends a VarAC broadcast and APRS bulletin so nearby hams can connect to the BBS and relay the information to the traveler.
+**Sitreps:** The family member posts a structured status report (house, vehicles, utilities, health, needs, relocation) to the VarAC BBS. HamLink automatically sends a 500 Hz VarAC broadcast so nearby hams can connect to the BBS and relay the information to the traveler.
 
 ## Files
 

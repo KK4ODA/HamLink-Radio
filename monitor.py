@@ -9,7 +9,7 @@ No ham radio knowledge required to use.
 All configuration in the browser Settings panel.
 """
 
-import json, os, sys, sqlite3, time, threading, logging, uuid, csv
+import json, os, sys, sqlite3, time, threading, logging, uuid, csv, atexit, signal
 from datetime import datetime, timezone
 from flask import Flask, jsonify, render_template_string, request
 
@@ -147,11 +147,11 @@ DEFAULT_CONFIG = {
             "auto_launch": True, "poll_interval": 30,
             "home_tactical": "", "traveler_tactical": "",
             "rf_fallback": False, "rf_gateway": "", "varafm_addr": "localhost:8300",
-            "varafm_exe_path": ""},
+            "varafm_exe_path": "", "position_reports": False},
     "beacon": {"enabled": False, "lat": 0.0, "lon": 0.0,
                "symbol_table": "/", "symbol_code": "-",
                "comment": "HamLink Radio", "interval_minutes": 30,
-               "via_aprsis": True, "via_rf": True},
+               "via_aprsis": True, "via_rf": False},
     "web_port": 5000,
     "alert_sound": "gentle",
     "alert_volume": 0.3,
@@ -214,6 +214,7 @@ state = {
     "kiss_connected": False, "kiss_error": None,
     "pat_connected": False, "pat_error": None, "pat_last_check": None,
     "aprs_last_position": None,
+    "winlink_last_position": None,
 }
 slock = threading.Lock()
 
@@ -322,15 +323,23 @@ def _aprs_send_via_kiss(aprs_str):
     return False
 
 def _aprs_send_ack(to_call, msgno):
-    """Send an APRS message ACK immediately via both APRS-IS and RF."""
+    """Send an APRS message ACK via APRS-IS. Only sends via RF if RF fallback
+    is enabled and internet is down (same logic as aprs_send_message)."""
     home = _aprs_callsign()
     padded = to_call.ljust(9)
-    ack_pkt = f"{home}>APRS,TCPIP*::{padded}:ack{msgno}"
-    log.info("APRS ACK -> %s for msg# %s", to_call, msgno)
-    _aprs_send_raw(ack_pkt)
-    # Also send via RF if Soundmodem is connected
-    rf_pkt = f"{home}>APRS,WIDE1-1::{padded}:ack{msgno}"
-    _aprs_send_via_kiss(rf_pkt)
+
+    with cfglock:
+        rf_fallback = config.get("aprs", {}).get("rf_fallback", False)
+    use_rf = rf_fallback and not _check_internet(timeout=2)
+
+    if use_rf:
+        rf_pkt = f"{home}>APRS,WIDE1-1::{padded}:ack{msgno}"
+        log.info("APRS ACK (RF) -> %s for msg# %s", to_call, msgno)
+        _aprs_send_via_kiss(rf_pkt)
+    else:
+        ack_pkt = f"{home}>APRS,TCPIP*::{padded}:ack{msgno}"
+        log.info("APRS ACK (APRS-IS) -> %s for msg# %s", to_call, msgno)
+        _aprs_send_raw(ack_pkt)
 
 def _process_aprs_packet(packet):
     """Process a parsed APRS packet."""
@@ -511,41 +520,6 @@ def aprs_send_message(to_call, message):
             log.info("APRS mailbox copy sent to MAIL for %s", mail_dest)
         return True, ""
     return False, "Failed to send"
-
-def aprs_send_bulletin(bulletin_id, message):
-    """Send an APRS bulletin (BLN#) via a dedicated APRS-IS connection and RF.
-    Uses a fresh unfiltered connection so the server propagates the bulletin."""
-    home = _aprs_callsign()
-    if not home:
-        return False, "Home callsign not configured"
-    padded = f"BLN{bulletin_id}".ljust(9)
-    msg = message[:67]
-    pkt = f"{home}>APRS,TCPIP*::{padded}:{msg}"
-    # Send via dedicated unfiltered connection (not the shared listener)
-    ok_is = False
-    try:
-        import aprslib
-        with cfglock:
-            ap = config.get("aprs", {})
-            base = config.get("home_callsign", "").strip().upper()
-        pc = ap.get("passcode", "") or str(aprs_passcode(base))
-        ais = aprslib.IS(home, passwd=pc,
-                         host=ap.get("server", "rotate.aprs2.net"),
-                         port=int(ap.get("port", 14580)))
-        ais.connect()
-        ais.sendall(pkt)
-        time.sleep(2)  # Give server time to propagate before disconnect
-        ais.close()
-        ok_is = True
-        log.info("APRS bulletin TX (APRS-IS): %s", pkt[:80])
-    except Exception as e:
-        log.warning("APRS bulletin APRS-IS send failed: %s", e)
-    # Also send via RF
-    rf_pkt = f"{home}>APRS,WIDE1-1,WIDE2-1::{padded}:{msg}"
-    _aprs_send_via_kiss(rf_pkt)
-    if ok_is:
-        log.info("APRS bulletin BLN%s sent: %s", bulletin_id, msg)
-    return ok_is, "" if ok_is else "APRS-IS send failed"
 
 
 def _aprs_listener_loop():
@@ -1688,50 +1662,114 @@ def pat_send_message(to_addr, subject, body):
         return False, str(e)
 
 def pat_connect_telnet():
-    """Trigger Pat to connect via telnet, or via VARA FM gateway if no internet."""
+    """Trigger Pat to sync via its HTTP API (POST /api/connect).
+    Uses the running Pat HTTP server instead of spawning a separate process."""
     try:
-        import subprocess
+        import urllib.request, urllib.parse
         with cfglock:
-            exe = config.get("pat", {}).get("exe_path", "")
             rf_fallback = config.get("pat", {}).get("rf_fallback", False)
             rf_gateway = config.get("pat", {}).get("rf_gateway", "")
-        if not exe or not os.path.isfile(exe):
-            return False
 
-        # Check internet and decide connection method
+        # Determine connection URL
         use_rf = False
         if rf_fallback and rf_gateway and not _check_internet(timeout=2):
             use_rf = True
-            log.info("No internet — Pat connecting via VARA FM to %s", rf_gateway)
-
-        if use_rf:
             connect_url = f"varafm:///{rf_gateway}"
-            cmd = [exe, "connect", connect_url]
-            timeout_secs = 300  # RF connections take longer
+            log.info("No internet — Pat connecting via VARA FM to %s", rf_gateway)
         else:
-            cmd = [exe, "connect", "telnet"]
-            timeout_secs = 120
+            connect_url = "telnet"
 
-        log.info("Pat sync: %s", " ".join(cmd))
-        proc = subprocess.run(
-            cmd, cwd=os.path.dirname(exe),
-            capture_output=True, timeout=timeout_secs
-        )
-        if proc.returncode == 0:
-            log.info("Pat session completed (%s)", "RF" if use_rf else "telnet")
-            return True
-        log.warning("Pat connect failed: %s", proc.stderr.decode()[:200])
-        return False
-    except subprocess.TimeoutExpired:
-        log.warning("Pat session timed out")
-        return False
+        api_url = _pat_api_url() + "/connect"
+        data = urllib.parse.urlencode({"url": connect_url}).encode()
+        req = urllib.request.Request(api_url, data=data, method="POST")
+        timeout_secs = 300 if use_rf else 120
+
+        log.info("Pat sync via HTTP API: %s (url=%s)", api_url, connect_url)
+        resp = urllib.request.urlopen(req, timeout=timeout_secs)
+        result = json.loads(resp.read().decode())
+        num_received = result.get("NumReceived", 0)
+        log.info("Pat session completed (%s) — %d new messages",
+                 "RF" if use_rf else "telnet", num_received)
+        return True
     except Exception as e:
-        log.warning("Pat connect failed: %s", e)
+        err_str = str(e)
+        if "500" in err_str:
+            log.warning("Pat connect session failed (server error)")
+        elif "timed out" in err_str.lower():
+            log.warning("Pat connect timed out")
+        else:
+            log.warning("Pat connect failed: %s", err_str[:200])
         return False
+
+def _winlink_check_position():
+    """Query Winlink CMS RSS feed for the traveler's latest position report."""
+    with cfglock:
+        pos_enabled = config.get("pat", {}).get("position_reports", False)
+        watch = config.get("watch_callsigns", [])
+    if not pos_enabled or not watch:
+        return
+    # Use base callsign (no SSID)
+    callsign = watch[0].upper().split("-")[0].split("/")[0].strip()
+    if not callsign:
+        return
+    try:
+        import urllib.request
+        import xml.etree.ElementTree as ET
+        url = f"https://cms.winlink.org:444/rss/rsspositionreports.aspx?callsign={callsign}"
+        req = urllib.request.Request(url, headers={"User-Agent": "HamLink Radio"})
+        resp = urllib.request.urlopen(req, timeout=15)
+        raw = resp.read().decode()
+        root = ET.fromstring(raw)
+        # Find the first (most recent) item in the RSS feed
+        item = root.find(".//item")
+        if item is None:
+            log.info("Winlink position: no reports for %s", callsign)
+            return
+        title = (item.findtext("title") or "").strip()
+        desc = (item.findtext("description") or "").strip()
+        pub_date = (item.findtext("pubDate") or "").strip()
+        # Parse lat/lon from description — typical format includes coordinates
+        # Try to extract from georss:point if present
+        lat, lon = None, None
+        georss = item.find("{http://www.georss.org/georss}point")
+        if georss is not None and georss.text:
+            parts = georss.text.strip().split()
+            if len(parts) == 2:
+                lat, lon = float(parts[0]), float(parts[1])
+        # Fallback: parse from description text (e.g. "Latitude: 33.84, Longitude: -84.28")
+        if lat is None and desc:
+            import re
+            lat_m = re.search(r'[Ll]at(?:itude)?[:\s]+(-?[\d.]+)', desc)
+            lon_m = re.search(r'[Ll]on(?:gitude)?[:\s]+(-?[\d.]+)', desc)
+            if lat_m and lon_m:
+                lat, lon = float(lat_m.group(1)), float(lon_m.group(1))
+        if lat is None or lon is None:
+            log.info("Winlink position: could not parse coordinates from %s", callsign)
+            return
+        # Parse timestamp
+        pos_time = None
+        if pub_date:
+            try:
+                from email.utils import parsedate_to_datetime
+                pos_time = parsedate_to_datetime(pub_date).isoformat()
+            except Exception:
+                pos_time = pub_date
+        with slock:
+            state["winlink_last_position"] = {
+                "callsign": callsign,
+                "lat": lat, "lon": lon,
+                "time": pos_time or datetime.now(timezone.utc).isoformat(),
+                "comment": title or desc,
+                "source": "winlink",
+            }
+        log.info("Winlink position for %s: %.4f, %.4f (%s)", callsign, lat, lon, title)
+    except Exception as e:
+        log.warning("Winlink position check failed: %s", e)
+
 
 def _pat_poll_loop():
     """Background thread: sync with Winlink CMS and poll Pat inbox periodically.
-    
+
     The poll_interval controls how often we trigger a full telnet sync.
     Between syncs, we check the local inbox every 15 seconds so messages
     arriving via Pat's own schedule or manual sync are detected quickly.
@@ -1739,30 +1777,35 @@ def _pat_poll_loop():
     global _pat_running
     INBOX_CHECK_INTERVAL = 15  # seconds between local inbox checks
     while _pat_running:
-        with cfglock:
-            pt = config.get("pat", {})
-            enabled = pt.get("enabled", False)
-            sync_interval = max(pt.get("poll_interval", 300), 60)
-        if not enabled:
-            with slock:
-                state["pat_connected"] = False
-                state["pat_error"] = None
-            time.sleep(5)
-            continue
-        # Full sync with CMS
-        log.info("Pat: syncing with Winlink CMS (next sync in %ds)", sync_interval)
-        pat_connect_telnet()
-        _pat_check_inbox()
-        # Between syncs, keep checking local inbox frequently
-        elapsed = 0
-        while elapsed < sync_interval and _pat_running:
-            time.sleep(INBOX_CHECK_INTERVAL)
-            elapsed += INBOX_CHECK_INTERVAL
+        try:
             with cfglock:
-                still_enabled = config.get("pat", {}).get("enabled", False)
-            if not still_enabled:
-                break
+                pt = config.get("pat", {})
+                enabled = pt.get("enabled", False)
+                sync_interval = max(pt.get("poll_interval", 60), 60)
+            if not enabled:
+                with slock:
+                    state["pat_connected"] = False
+                    state["pat_error"] = None
+                time.sleep(5)
+                continue
+            # Full sync with CMS
+            log.info("Pat: syncing with Winlink CMS (next sync in %ds)", sync_interval)
+            pat_connect_telnet()
             _pat_check_inbox()
+            _winlink_check_position()
+            # Between syncs, keep checking local inbox frequently
+            elapsed = 0
+            while elapsed < sync_interval and _pat_running:
+                time.sleep(INBOX_CHECK_INTERVAL)
+                elapsed += INBOX_CHECK_INTERVAL
+                with cfglock:
+                    still_enabled = config.get("pat", {}).get("enabled", False)
+                if not still_enabled:
+                    break
+                _pat_check_inbox()
+        except Exception as e:
+            log.error("Pat poll loop error (will retry): %s", e)
+            time.sleep(15)  # Avoid tight error loop
 
 def start_pat():
     global _pat_thread, _pat_running
@@ -1928,6 +1971,9 @@ def send_pushover(title, message, reply_channel="varac"):
                 else:
                     link = f"{base_url}/api/pushover_reply?channel=varac&message={encoded}"
                 html_body += f'→ <a href="{link}">{qr_short}</a><br>'
+
+        # Always include a dismiss link so the user can silence HamLink from their phone
+        html_body += f'<br><a href="{base_url}/api/dismiss_from_phone">Dismiss Alert</a>'
 
         p = {"token": po["api_token"], "user": po["user_key"],
              "title": title, "message": html_body, "html": "1",
@@ -2201,6 +2247,77 @@ def _trim_memory():
         _aprs_seen_msgs = set(trimmed)
 
 # ---------------------------------------------------------------------------
+# Graceful shutdown
+# ---------------------------------------------------------------------------
+_shutdown_done = False
+
+def _kill_proc(name, proc):
+    """Terminate a subprocess, with escalation to kill."""
+    if not proc or proc.poll() is not None:
+        return
+    log.info("Stopping %s (PID %d)...", name, proc.pid)
+    try:
+        proc.terminate()
+        proc.wait(timeout=5)
+        log.info("%s stopped.", name)
+    except Exception:
+        try:
+            proc.kill()
+            proc.wait(timeout=3)
+            log.info("%s killed.", name)
+        except Exception:
+            log.warning("Could not stop %s", name)
+
+def _kill_by_name(exe_name):
+    """Kill a Windows process by executable name using taskkill."""
+    if sys.platform != "win32":
+        return
+    try:
+        import subprocess
+        subprocess.run(["taskkill", "/F", "/IM", exe_name],
+                       capture_output=True, timeout=5)
+        log.info("Killed %s via taskkill", exe_name)
+    except Exception as e:
+        log.warning("taskkill %s failed: %s", exe_name, e)
+
+def _cleanup():
+    """Terminate all launched subprocesses and stop background threads."""
+    global _aprs_running, _kiss_running, _beacon_running, _shutdown_done
+    if _shutdown_done:
+        return
+    _shutdown_done = True
+    log.info("HamLink shutting down — stopping threads and processes...")
+
+    # Signal all background threads to stop
+    _aprs_running = False
+    _kiss_running = False
+    _beacon_running = False
+
+    # Terminate launched subprocesses (direct references, not globals lookup)
+    _kill_proc("VarAC", _varac_proc)
+    _kill_proc("Soundmodem", _soundmodem_proc)
+    _kill_proc("Pat", _pat_proc)
+    _kill_proc("VARA FM", _varafm_proc)
+
+    # Kill VARA HF by process name (launched by VarAC, not tracked by HamLink)
+    _kill_by_name("VARA.exe")
+    # Also kill Soundmodem by name in case the proc handle didn't work
+    _kill_by_name("soundmodem.exe")
+
+    log.info("HamLink shutdown complete.")
+
+atexit.register(_cleanup)
+
+def _signal_handler(signum, frame):
+    """Handle Ctrl+C and SIGTERM for clean shutdown."""
+    log.info("Signal %d received, shutting down...", signum)
+    _cleanup()
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
+
+# ---------------------------------------------------------------------------
 # Flask
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
@@ -2270,6 +2387,7 @@ def api_status():
                 "poll_interval": config.get("pat", {}).get("poll_interval", 30),
                 "home_tactical": config.get("pat", {}).get("home_tactical", ""),
                 "traveler_tactical": config.get("pat", {}).get("traveler_tactical", ""),
+                "position_reports": config.get("pat", {}).get("position_reports", False),
                 "rf_fallback": config.get("pat", {}).get("rf_fallback", False),
                 "rf_gateway": config.get("pat", {}).get("rf_gateway", ""),
                 "varafm_addr": config.get("pat", {}).get("varafm_addr", "localhost:8300"),
@@ -2317,6 +2435,7 @@ def api_status():
             "pat_connected": state["pat_connected"],
             "pat_error": state["pat_error"],
             "aprs_last_position": state["aprs_last_position"],
+            "winlink_last_position": state["winlink_last_position"],
             "config": cfg_snap,
             "csrf_token": _csrf_token,
         })
@@ -2342,6 +2461,20 @@ def api_ack_all():
     stop_speaker_alarm()
     return jsonify({"ok": True})
 
+@app.route("/api/dismiss_from_phone")
+def api_dismiss_from_phone():
+    """Dismiss all alerts from a phone link (Pushover notification)."""
+    with slock:
+        for a in state["pending_alerts"]:
+            state["acknowledged_ids"].add(a["id"])
+        state["pending_alerts"] = []
+    stop_speaker_alarm()
+    log.info("Alerts dismissed from phone")
+    return """<html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+    <style>body{font-family:system-ui;text-align:center;padding:40px 20px;background:#f0fdf4;color:#166534}
+    h2{font-size:20px}p{color:#64748b;margin-top:8px}</style></head>
+    <body><h2>Alert Dismissed</h2><p>The alarm has been silenced and alerts cleared.</p></body></html>"""
+
 @app.route("/api/stop_alarm", methods=["POST"])
 def api_stop_alarm():
     """Stop the PC speaker alarm without removing alerts from pending."""
@@ -2358,13 +2491,71 @@ def api_pushover_reply():
     import html as html_mod
     safe_msg = html_mod.escape(msg)
     safe_channel = html_mod.escape(channel)
+
+    # Determine if this channel would use non-compliant RF
+    nc_rf = False
+    if channel == "aprs":
+        with slock:
+            aprs_connected = state.get("aprs_connected", False)
+            kiss_connected = state.get("kiss_connected", False)
+        if kiss_connected and not aprs_connected:
+            nc_rf = True  # APRS would fall back to Soundmodem RF (exceeds 500 Hz)
+
+    if nc_rf:
+        # Non-compliant RF — show blocking page with licensed/emergency override
+        return f"""<html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+    <style>
+      body{{font-family:system-ui;padding:30px 20px;background:#f8f9fb;color:#1e293b;max-width:480px;margin:0 auto}}
+      .card{{background:#fff;border-radius:14px;padding:24px;box-shadow:0 1px 3px rgba(0,0,0,0.1);margin-bottom:16px}}
+      h2{{font-size:20px;margin-bottom:12px;color:#dc2626}}
+      .msg{{background:#f1f5f9;padding:12px;border-radius:8px;font-size:15px;margin:12px 0}}
+      .warn-block{{background:#fef2f2;border:1px solid #fca5a5;border-radius:8px;padding:12px;font-size:13px;color:#991b1b;margin:16px 0}}
+      .btn{{display:block;width:100%;padding:16px;border:none;border-radius:10px;font-size:14px;font-weight:700;cursor:pointer;margin-top:10px}}
+      .btn-licensed{{background:#eff6ff;color:#1d4ed8;border:1px solid #2563eb}}
+      .btn-emergency{{background:#fef2f2;color:#dc2626;border:1px solid #dc2626}}
+      .btn-cancel{{background:#e2e8f0;color:#64748b}}
+      .via{{font-size:13px;color:#64748b;margin-top:4px}}
+    </style></head>
+    <body>
+      <div class="card">
+        <h2>RF Bandwidth Compliance Warning</h2>
+        <p>This message will be transmitted via APRS Soundmodem (RF) because internet is unavailable.</p>
+        <div class="msg">{safe_msg}</div>
+        <div class="via">Channel: {safe_channel.upper()} (RF fallback)</div>
+      </div>
+      <div class="warn-block">
+        <strong>FCC Part 97.221:</strong> Automatically controlled digital stations must not exceed
+        500 Hz occupied bandwidth. APRS via Soundmodem exceeds this limit and is
+        <strong>blocked by default</strong>.
+        <br><br>
+        To proceed, you must confirm one of the following:
+      </div>
+      <form method="POST" action="/api/pushover_reply_send">
+        <input type="hidden" name="channel" value="{safe_channel}">
+        <input type="hidden" name="message" value="{safe_msg}">
+        <button type="submit" name="override" value="licensed" class="btn btn-licensed">I am a licensed operator and I am present at or supervising this station</button>
+        <button type="submit" name="override" value="emergency" class="btn btn-emergency">Emergency &mdash; immediate safety of life or property (FCC Part 97.403)</button>
+      </form>
+      <button class="btn btn-cancel" onclick="window.close()">Cancel</button>
+    </body></html>"""
+
+    is_varac = (channel == "varac")
+    heading = "Confirm Message" if is_varac else "Confirm Transmission"
+    description = ("Your message will be queued to the VarAC outbox. "
+                    "It will be transmitted when the remote operator next connects to your station."
+                    ) if is_varac else (
+                    "Your message will be sent via APRS-IS (internet). "
+                    "No RF transmission will occur from your station.")
+    via_label = f"Channel: {safe_channel.upper()} ({'queued to outbox' if is_varac else 'internet'})"
+    btn_label = "Queue Message" if is_varac else "Confirm &amp; Send"
+
     return f"""<html><head><meta name="viewport" content="width=device-width,initial-scale=1">
     <style>
       body{{font-family:system-ui;padding:30px 20px;background:#f8f9fb;color:#1e293b;max-width:480px;margin:0 auto}}
       .card{{background:#fff;border-radius:14px;padding:24px;box-shadow:0 1px 3px rgba(0,0,0,0.1);margin-bottom:16px}}
       h2{{font-size:20px;margin-bottom:12px}}
       .msg{{background:#f1f5f9;padding:12px;border-radius:8px;font-size:15px;margin:12px 0}}
-      .warn{{background:#fef3c7;border:1px solid #f59e0b;border-radius:8px;padding:12px;font-size:13px;color:#92400e;margin:16px 0}}
+      .info{{background:#f0f9ff;border:1px solid #7dd3fc;border-radius:8px;padding:12px;font-size:13px;color:#0c4a6e;margin:16px 0}}
       .btn{{display:block;width:100%;padding:16px;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;margin-top:10px}}
       .btn-send{{background:#16a34a;color:#fff}}
       .btn-cancel{{background:#e2e8f0;color:#64748b}}
@@ -2372,23 +2563,19 @@ def api_pushover_reply():
     </style></head>
     <body>
       <div class="card">
-        <h2>Confirm Transmission</h2>
-        <p>You are about to transmit the following message via amateur radio:</p>
+        <h2>{heading}</h2>
+        <p>{description}</p>
         <div class="msg">{safe_msg}</div>
-        <div class="via">Channel: {safe_channel.upper()}</div>
+        <div class="via">{via_label}</div>
       </div>
-      <div class="warn">
+      <div class="info">
         All amateur radio transmissions are made under the authority of the station license.
-        Only licensed amateur radio operators or authorized third parties under the direct
-        supervision of a licensed control operator may initiate transmissions (FCC Part 97.115).
-        <br><br>
-        <strong>Emergency exception:</strong> In situations involving the immediate safety of human
-        life or protection of property, any means of radio communication may be used (FCC Part 97.403).
+        The station licensee is responsible for all messages sent through this application (FCC Part 97.115).
       </div>
       <form method="POST" action="/api/pushover_reply_send">
         <input type="hidden" name="channel" value="{safe_channel}">
         <input type="hidden" name="message" value="{safe_msg}">
-        <button type="submit" class="btn btn-send">Confirm &amp; Send</button>
+        <button type="submit" class="btn btn-send">{btn_label}</button>
       </form>
       <button class="btn btn-cancel" onclick="window.close()">Cancel</button>
     </body></html>"""
@@ -2446,7 +2633,7 @@ def api_pushover_reply_send():
                         (g, now_utc, outbox_id, to_call.upper(), home_call, msg))
                     conn.commit()
                     conn.close()
-                    result = f"Sent via VarAC VMail to {to_call}"
+                    result = f"Queued to VarAC outbox for {to_call}"
                     log_reply(to_call, msg)
                 except Exception as e:
                     result = f"VarAC error: {e}"
@@ -2468,7 +2655,7 @@ def api_pushover_reply_send():
     return f"""<html><head><meta name="viewport" content="width=device-width,initial-scale=1">
     <style>body{{font-family:system-ui;text-align:center;padding:40px 20px;background:#f0fdf4;color:#166534}}
     h2{{font-size:20px}}p{{color:#64748b;margin-top:8px}}</style></head>
-    <body><h2>Reply Sent</h2><p>{safe_result}</p><p>"{safe_msg}"</p></body></html>"""
+    <body><h2>{"Message Queued" if channel == "varac" else "Reply Sent"}</h2><p>{safe_result}</p><p>"{safe_msg}"</p></body></html>"""
 
 
 @app.route("/api/pat_config", methods=["GET"])
@@ -2712,7 +2899,7 @@ def api_set_config():
                 if sk in d["soundmodem"]:
                     config["soundmodem"][sk] = d["soundmodem"][sk]
         if "pat" in d:
-            for pk2 in ["enabled", "exe_path", "http_addr", "auto_launch", "poll_interval", "home_tactical", "traveler_tactical", "rf_fallback", "rf_gateway", "varafm_addr", "varafm_exe_path"]:
+            for pk2 in ["enabled", "exe_path", "http_addr", "auto_launch", "poll_interval", "home_tactical", "traveler_tactical", "position_reports", "rf_fallback", "rf_gateway", "varafm_addr", "varafm_exe_path"]:
                 if pk2 in d["pat"]:
                     config["pat"][pk2] = d["pat"][pk2]
         if "beacon" in d:
@@ -2896,27 +3083,6 @@ def api_sitrep():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
 
-    # Send APRS bulletin announcement
-    bulletin_sent = False
-    bulletin_msg = ""
-    with cfglock:
-        aprs_on = config.get("aprs", {}).get("enabled", False)
-    if aprs_on:
-        freq = get_varac_frequency()
-        qsy = get_varac_next_qsy()
-        # Build bulletin — keep it tight for the 67 char APRS limit
-        parts = [f"SITREP#{num:03d} {callsign} BBS"]
-        if freq:
-            parts.append(f"{freq}MHz")
-        if qsy:
-            parts.append(f"QSY {qsy[0]}Z {qsy[1]}")
-        parts.append("pls relay")
-        bulletin_msg = " ".join(parts)[:67]
-        ok, err = aprs_send_bulletin("1", bulletin_msg)
-        bulletin_sent = ok
-        if not ok:
-            log.warning("Sitrep APRS bulletin failed: %s", err)
-
     # Send VarAC broadcast via UI automation
     varac_broadcast_sent = False
     varac_broadcast_msg = ""
@@ -2936,7 +3102,6 @@ def api_sitrep():
         log.warning("VarAC broadcast error: %s", e)
 
     return jsonify({"ok": True, "number": num, "filename": filename, "path": filepath,
-                    "bulletin_sent": bulletin_sent, "bulletin_msg": bulletin_msg,
                     "varac_broadcast_sent": varac_broadcast_sent,
                     "varac_broadcast_msg": varac_broadcast_msg})
 
@@ -2985,6 +3150,18 @@ def api_test_pushover():
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
+
+
+@app.route("/api/shutdown", methods=["POST"])
+def api_shutdown():
+    """Gracefully stop HamLink and all associated programs."""
+    log.info("Shutdown requested via web UI")
+    def _do_shutdown():
+        time.sleep(1)  # Give Flask time to send the response
+        _cleanup()
+        os._exit(0)
+    threading.Thread(target=_do_shutdown, daemon=True).start()
+    return jsonify({"ok": True, "message": "HamLink is shutting down..."})
 
 
 @app.route("/api/browse_path", methods=["POST"])
@@ -3325,7 +3502,10 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
     <div class="sub" style="text-align:center">Please read and acknowledge before using this application.</div>
     <div class="compliance-body">
       <h3>Amateur Radio License Required</h3>
-      This application interfaces with amateur (ham) radio equipment operating under FCC Part 97 rules.
+      This application is designed for use under United States FCC Part 97 amateur radio regulations.
+      Operation outside the United States requires the operator to verify compliance with their
+      country's amateur radio regulations, which may differ significantly from FCC rules.
+      <br><br>
       A valid FCC amateur radio license is required for the station operator. The station licensee
       is responsible for all transmissions made from the station, including those initiated through this app.
 
@@ -3339,11 +3519,17 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
       even if operating remotely. The licensee is responsible for configuring the station and ensuring
       all transmissions comply with FCC rules.
 
-      <br><br><strong>2. Data emission exception.</strong>
+      <br><br><strong>2. Data emission exception and bandwidth limit.</strong>
       FCC 97.115(c) states: "No station may transmit third party communications while being automatically
-      controlled except a station transmitting a RTTY or data emission." Both VarAC (VARA data mode)
-      and APRS are classified as data emissions, which qualifies for this exception. This is the same
-      model used by Winlink, packet BBS, and APRS messaging systems.
+      controlled except a station transmitting a RTTY or data emission." All modes used by this
+      application (VarAC/VARA, APRS, Winlink) are classified as data emissions, satisfying this exception.
+      However, FCC 97.221 also requires that automatically controlled digital stations must not exceed
+      500 Hz occupied bandwidth. <strong>Only VARA HF in 500 Hz mode meets both requirements.</strong>
+      APRS via Soundmodem (1200-baud AFSK) and VARA FM exceed the 500 Hz bandwidth limit and
+      <strong>must not</strong> be operated under automatic control — a licensed control operator must
+      be present or supervising when using these modes. This application blocks non-compliant RF
+      transmissions by default and requires the operator to confirm they are licensed or to invoke
+      the emergency exception (97.403) before proceeding.
 
       <br><br><strong>3. Messages must be personal in nature.</strong>
       Communications must be limited to remarks of a personal character — family check-ins,
@@ -3377,7 +3563,7 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
       This notice is informational and does not constitute legal advice. For definitive
       guidance, consult FCC Part 97 directly or contact the ARRL.
 
-      <br><br><span class="ref">References: 47 CFR §97.3, §97.109, §97.113, §97.115, §97.119, §97.403</span>
+      <br><br><span class="ref">References: 47 CFR §97.3, §97.109, §97.113, §97.115, §97.119, §97.221, §97.403</span>
     </div>
 
     <div class="compliance-check" id="chk1" onclick="toggleCheck(1)">
@@ -3529,7 +3715,22 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
       </div>
 
       <div class="sett-section">
-        <h3>Position Beacon</h3>
+        <h3>APRS RF Monitor (Soundmodem)</h3>
+        <div class="fg"><div class="tgl-row"><label class="fl" style="margin:0">Enable RF APRS via Soundmodem</label>
+          <div class="tgl" id="cSmOn" onclick="this.classList.toggle('on');updateBcnRfAvail()"></div></div>
+          <div class="fhint">Connects to UZ7HO Soundmodem KISS port for RF APRS receive and transmit</div></div>
+        <div class="fg"><label class="fl">Soundmodem Path</label>
+          <input class="fi" id="cSmPath" placeholder="C:\Soundmodem\soundmodem.exe">
+          <div class="fhint">Full path to soundmodem.exe — launched automatically on startup</div></div>
+        <div class="fg"><label class="fl">KISS TCP Host</label>
+          <input class="fi" id="cSmHost" placeholder="127.0.0.1" style="width:180px"></div>
+        <div class="fg"><label class="fl">KISS TCP Port</label>
+          <input class="fi" id="cSmPort" placeholder="8100" type="number" style="width:120px">
+          <div class="fhint">Default: 8100. Must match Soundmodem KISS Server Port setting.</div></div>
+      </div>
+
+      <div class="sett-section">
+        <h3>APRS Position Beacon</h3>
         <div class="fg"><div class="tgl-row"><label class="fl" style="margin:0">Enable Position Beacon</label>
           <div class="tgl" id="cBcnOn" onclick="this.classList.toggle('on')"></div></div>
           <div class="fhint">Periodically beacons your home station position so nearby iGates know you exist. Critical for receiving RF APRS messages when internet is down.</div></div>
@@ -3562,8 +3763,11 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
         <div class="fg"><div class="tgl-row"><label class="fl" style="margin:0">Beacon via APRS-IS (internet)</label>
           <div class="tgl" id="cBcnAprsIs" onclick="this.classList.toggle('on')"></div></div></div>
         <div class="fg"><div class="tgl-row"><label class="fl" style="margin:0">Beacon via RF (Soundmodem)</label>
-          <div class="tgl" id="cBcnRf" onclick="this.classList.toggle('on')"></div></div>
-          <div class="fhint">RF beaconing is essential for iGates to relay messages to you when internet is down</div></div>
+          <div class="tgl" id="cBcnRf" onclick="this.classList.toggle('on');updateBcnRfWarn()"></div></div>
+          <div id="bcnRfWarn" style="display:none;background:#fef2f2;border:1px solid #fca5a5;border-radius:8px;padding:10px;font-size:12px;color:#991b1b;margin-top:6px">
+            <strong>FCC Part 97.221:</strong> RF beacons via Soundmodem exceed the 500 Hz bandwidth limit for automatically controlled digital stations. Enabling this requires a licensed amateur radio operator to be present at or supervising the station. In an emergency involving immediate safety of life or property, the emergency exception (FCC Part 97.403) may apply.
+          </div>
+          <div class="fhint">RF beaconing helps iGates relay messages to you when internet is down. Off by default — requires a licensed operator present or supervising (97.221).</div></div>
       </div>
 
       <div class="sett-section">
@@ -3604,6 +3808,9 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
               <input class="fi" id="cPatTravTac" placeholder="e.g. FACUNDO" style="width:180px">
               <div class="fhint">Messages will be sent TO this address by default</div></div>
           </div>
+        <div class="fg"><div class="tgl-row"><label class="fl" style="margin:0">Query Winlink Position Reports</label>
+          <div class="tgl" id="cPatPosReports" onclick="this.classList.toggle('on')"></div></div>
+          <div class="fhint">Periodically checks the Winlink CMS for the traveler's latest position report. Position is displayed on the dashboard.</div></div>
         <div class="fg"><div class="tgl-row"><label class="fl" style="margin:0">Use VARA FM gateway if no internet</label>
           <div class="tgl" id="cPatRfFallback" onclick="this.classList.toggle('on')"></div></div>
           <div class="fhint">When internet is unavailable, Pat will connect to a nearby VARA FM gateway instead of telnet</div></div>
@@ -3623,21 +3830,6 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
           <button class="btn-small primary" onclick="savePatConfig()" style="margin-top:8px">Save Pat Configuration</button>
           <span id="patSaveStatus" style="font-size:12px;color:var(--text3);margin-left:10px"></span>
         </div>
-      </div>
-
-      <div class="sett-section">
-        <h3>APRS RF Monitor (Soundmodem)</h3>
-        <div class="fg"><div class="tgl-row"><label class="fl" style="margin:0">Enable RF APRS via Soundmodem</label>
-          <div class="tgl" id="cSmOn" onclick="this.classList.toggle('on')"></div></div>
-          <div class="fhint">Connects to UZ7HO Soundmodem KISS port for RF APRS receive and transmit</div></div>
-        <div class="fg"><label class="fl">Soundmodem Path</label>
-          <input class="fi" id="cSmPath" placeholder="C:\Soundmodem\soundmodem.exe">
-          <div class="fhint">Full path to soundmodem.exe — launched automatically on startup</div></div>
-        <div class="fg"><label class="fl">KISS TCP Host</label>
-          <input class="fi" id="cSmHost" placeholder="127.0.0.1" style="width:180px"></div>
-        <div class="fg"><label class="fl">KISS TCP Port</label>
-          <input class="fi" id="cSmPort" placeholder="8100" type="number" style="width:120px">
-          <div class="fhint">Default: 8100. Must match Soundmodem KISS Server Port setting.</div></div>
       </div>
 
       <button class="btn-save" onclick="saveSett()">Save Settings</button>
@@ -3750,7 +3942,7 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
         <label style="cursor:pointer;display:flex;align-items:center;gap:4px" id="chkWinlinkLabel">
           <input type="checkbox" id="chkWinlink" checked> Winlink <span style="color:var(--text3)" id="wlPathLabel">(internet)</span></label>
         <label style="cursor:pointer;display:flex;align-items:center;gap:4px" id="chkVaracLabel">
-          <input type="checkbox" id="chkVarac" checked> VarAC <span style="color:var(--text3)" id="varacPathLabel">(RF — peer to peer)</span></label>
+          <input type="checkbox" id="chkVarac" checked> VarAC <span style="color:var(--text3)" id="varacPathLabel">(queued to outbox)</span></label>
       </div>
     </div>
     <div id="rfWarning" style="display:none;background:#fef3c7;border:1px solid #f59e0b;border-radius:8px;padding:10px;font-size:12px;color:#92400e;margin-top:10px">
@@ -3766,16 +3958,19 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
     </div>
   </div>
 
-  <!-- RF CONFIRMATION MODAL -->
-  <div id="rfConfirmModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.4);z-index:400;align-items:center;justify-content:center">
-    <div style="background:#fff;border-radius:14px;padding:24px;max-width:420px;margin:20px;box-shadow:0 4px 20px rgba(0,0,0,.15)">
-      <h3 style="font-size:18px;margin-bottom:12px">Confirm RF Transmission</h3>
-      <p style="font-size:14px;color:#475569;line-height:1.5">Your message will be transmitted over amateur radio (RF). All amateur radio transmissions are made under the authority of the station license.</p>
-      <p style="font-size:13px;color:#475569;line-height:1.5;margin-top:8px">Only licensed amateur radio operators or authorized third parties under the direct supervision of a licensed control operator may initiate transmissions (FCC Part 97.115).</p>
-      <p style="font-size:13px;color:#475569;line-height:1.5;margin-top:8px">In an emergency involving the immediate safety of human life or protection of property, any means of radio communication may be used (FCC Part 97.403).</p>
-      <div style="display:flex;gap:10px;margin-top:16px">
-        <button onclick="cancelRfSend()" style="flex:1;padding:12px;border-radius:10px;border:none;background:#e2e8f0;color:#64748b;font-size:14px;font-weight:600;cursor:pointer">Cancel</button>
-        <button onclick="proceedRfSend()" style="flex:1;padding:12px;border-radius:10px;border:none;background:#16a34a;color:#fff;font-size:14px;font-weight:700;cursor:pointer">Confirm &amp; Send</button>
+  <!-- NON-COMPLIANT RF BLOCKING MODAL (APRS Soundmodem / VARA FM) -->
+  <div id="rfNonCompliantModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.4);z-index:400;align-items:center;justify-content:center">
+    <div style="background:#fff;border-radius:14px;padding:24px;max-width:480px;margin:20px;box-shadow:0 4px 20px rgba(0,0,0,.15)">
+      <h3 style="font-size:18px;margin-bottom:12px;color:#dc2626">RF Bandwidth Compliance Warning</h3>
+      <p id="ncRfDetails" style="font-size:14px;color:#475569;line-height:1.5"></p>
+      <div style="background:#fef2f2;border:1px solid #fca5a5;border-radius:8px;padding:12px;margin:12px 0">
+        <p style="font-size:13px;color:#991b1b;line-height:1.5;margin:0"><strong>FCC Part 97.221:</strong> Automatically controlled digital stations must not exceed 500 Hz occupied bandwidth. The selected channel(s) exceed this limit and are <strong>blocked by default</strong>.</p>
+      </div>
+      <p style="font-size:13px;color:#475569;line-height:1.5">To proceed, you must confirm one of the following:</p>
+      <div style="display:flex;flex-direction:column;gap:8px;margin-top:12px">
+        <button onclick="proceedNcRfLicensed()" style="padding:12px;border-radius:10px;border:1px solid #2563eb;background:#eff6ff;color:#1d4ed8;font-size:13px;font-weight:600;cursor:pointer;text-align:left">I am a licensed amateur radio operator and I am present at or supervising this station</button>
+        <button onclick="proceedNcRfEmergency()" style="padding:12px;border-radius:10px;border:1px solid #dc2626;background:#fef2f2;color:#dc2626;font-size:13px;font-weight:600;cursor:pointer;text-align:left">Emergency — immediate safety of life or property (FCC Part 97.403)</button>
+        <button onclick="cancelNcRfSend()" style="padding:12px;border-radius:10px;border:none;background:#e2e8f0;color:#64748b;font-size:14px;font-weight:600;cursor:pointer">Cancel</button>
       </div>
     </div>
   </div>
@@ -3791,6 +3986,11 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
   </div>
   <div id="logArea" class="hidden">
     <div id="logEntries"></div>
+  </div>
+
+  <div style="text-align:center;margin-top:32px;padding-bottom:20px">
+    <button onclick="confirmShutdown()" style="padding:10px 20px;border-radius:10px;border:1px solid #dc2626;background:#fef2f2;color:#dc2626;font-size:13px;font-weight:600;cursor:pointer">Stop HamLink</button>
+    <div style="font-size:11px;color:var(--text3);margin-top:4px">Stops the app and closes VarAC, Soundmodem, Pat, and VARA FM</div>
   </div>
 </div>
 
@@ -3890,12 +4090,12 @@ function _openComposeBox(chan){
   var wlRf=d.config&&d.config.pat&&d.config.pat.rf_fallback;
   document.getElementById('wlPathLabel').textContent=wlRf?'(internet / RF fallback)':'(internet)';
   document.getElementById('wlPathLabel').style.color=wlRf?'#b45309':'var(--text3)';
-  document.getElementById('varacPathLabel').textContent='(RF)';
-  document.getElementById('varacPathLabel').style.color='#b45309';
+  document.getElementById('varacPathLabel').textContent='(queued to outbox)';
+  document.getElementById('varacPathLabel').style.color='var(--text3)';
   // Show RF warning and update on checkbox change
   function updateRfWarning(){
     var anyRf=false;
-    if(document.getElementById('chkVarac').checked)anyRf=true;
+    // VarAC replies go to outbox only (no RF) — don't count as RF
     if(document.getElementById('chkAprs').checked&&(aprsRf||aprsKiss))anyRf=true;
     document.getElementById('rfWarning').style.display=anyRf?'block':'none';
   }
@@ -3933,20 +4133,30 @@ function onComposeInput(){
 }
 
 function confirmAndSend(){
-  // Check if any selected channel involves RF
+  // Classify selected channels: internet-only, non-compliant-RF, or outbox-only (VarAC)
+  // VarAC replies go to outbox only — no RF transmission, no modal needed
   var d=window._d||{};
   var aprsRf=d.kiss_connected&&!d.aprs_connected;
-  var anyRf=false;
-  if(document.getElementById('chkVarac').checked)anyRf=true;
-  if(document.getElementById('chkAprs').checked&&aprsRf)anyRf=true;
-  if(anyRf){
-    document.getElementById('rfConfirmModal').style.display='flex';
+  var wlRf=d.config&&d.config.pat&&d.config.pat.rf_fallback;
+  var sendAprs=document.getElementById('chkAprs').checked;
+  var sendWl=document.getElementById('chkWinlink').checked;
+  // Non-compliant RF: APRS via Soundmodem or Winlink via VARA FM
+  var ncChannels=[];
+  if(sendAprs&&aprsRf)ncChannels.push('APRS via Soundmodem');
+  if(sendWl&&wlRf)ncChannels.push('Winlink via VARA FM');
+  if(ncChannels.length>0){
+    // Show blocking modal for non-compliant RF
+    document.getElementById('ncRfDetails').textContent=
+      'The following selected channel'+(ncChannels.length>1?'s':'')+' will transmit via RF with bandwidth exceeding 500 Hz: '+ncChannels.join(', ')+'.';
+    document.getElementById('rfNonCompliantModal').style.display='flex';
   }else{
+    // Internet-only or VarAC outbox — send directly
     sendMulti();
   }
 }
-function cancelRfSend(){document.getElementById('rfConfirmModal').style.display='none'}
-function proceedRfSend(){document.getElementById('rfConfirmModal').style.display='none';sendMulti()}
+function cancelNcRfSend(){document.getElementById('rfNonCompliantModal').style.display='none'}
+function proceedNcRfLicensed(){document.getElementById('rfNonCompliantModal').style.display='none';sendMulti()}
+function proceedNcRfEmergency(){document.getElementById('rfNonCompliantModal').style.display='none';sendMulti()}
 
 async function sendMulti(){
   var msg=document.getElementById('replyText').value.trim();
@@ -3981,7 +4191,7 @@ async function sendMulti(){
     try{
       var r=await cpost('/api/reply',{message:msg,subject:'Message'});
       var d=await r.json();
-      results.push(d.ok?'VarAC ✓':'VarAC: '+(d.error||'failed'));
+      results.push(d.ok?'VarAC ✓ (queued)':'VarAC: '+(d.error||'failed'));
     }catch(e){results.push('VarAC: error')}
   }
   document.getElementById('sendBtn').disabled=false;
@@ -4049,7 +4259,7 @@ function startAlarm(fromName){
   play(s,undefined,fromName);
   alarmInt=setInterval(()=>play(s,undefined,fromName),s==='voice'?8000:5000);
 }
-function stopAlarm(){if(alarmInt){clearInterval(alarmInt);alarmInt=null;if('speechSynthesis' in window)window.speechSynthesis.cancel()}}
+function stopAlarm(){if(alarmInt){clearInterval(alarmInt);alarmInt=null}if('speechSynthesis' in window){window.speechSynthesis.cancel()}}
 function preview(){
   const snd=document.getElementById('cSound').value;
   const v=parseInt(document.getElementById('cVol').value)/100;
@@ -4100,8 +4310,6 @@ async function sendSitrep(){
     if(d.ok){
       res.className='sitrep-result ok';
       var msg='SITREP #'+String(d.number).padStart(3,'0')+' posted to BBS: '+d.filename;
-      if(d.bulletin_sent)msg+='\nAPRS bulletin sent: '+d.bulletin_msg;
-      else if(d.bulletin_msg)msg+='\nAPRS bulletin failed to send';
       if(d.varac_broadcast_sent)msg+='\nVarAC broadcast sent: '+d.varac_broadcast_msg;
       else if(d.varac_broadcast_msg)msg+='\nVarAC broadcast failed';
       res.textContent=msg;
@@ -4169,23 +4377,35 @@ async function fillForm(){
   document.getElementById('cBcnInterval').value=bcn.interval_minutes||30;
   document.getElementById('cBcnComment').value=bcn.comment||'HamLink Radio';
   document.getElementById('cBcnAprsIs').classList.toggle('on',bcn.via_aprsis!==false);
-  document.getElementById('cBcnRf').classList.toggle('on',bcn.via_rf!==false);
+  document.getElementById('cBcnRf').classList.toggle('on',!!bcn.via_rf);
   const sm=c.soundmodem||{};
   document.getElementById('cSmOn').classList.toggle('on',!!sm.enabled);
   document.getElementById('cSmPath').value=sm.exe_path||'';
   document.getElementById('cSmHost').value=sm.kiss_host||'127.0.0.1';
   document.getElementById('cSmPort').value=sm.kiss_port||8100;
+  updateBcnRfAvail();
   const pt=c.pat||{};
   document.getElementById('cPatOn').classList.toggle('on',!!pt.enabled);
   document.getElementById('cPatPath').value=pt.exe_path||'';
   document.getElementById('cPatAddr').value=pt.http_addr||'localhost:8080';
   document.getElementById('cPatPoll').value=pt.poll_interval||30;
   document.getElementById('cPatHomeTac').value=pt.home_tactical||'';
+  document.getElementById('cPatPosReports').classList.toggle('on',!!pt.position_reports);
   document.getElementById('cPatRfFallback').classList.toggle('on',!!pt.rf_fallback);
   document.getElementById('cPatRfGw').value=pt.rf_gateway||'';
   document.getElementById('cPatVaraAddr').value=pt.varafm_addr||'localhost:8300';
   document.getElementById('cPatVaraExe').value=pt.varafm_exe_path||'';
   document.getElementById('cPatTravTac').value=pt.traveler_tactical||'';
+}
+
+async function confirmShutdown(){
+  if(!confirm('Stop HamLink and close all associated programs (VarAC, Soundmodem, Pat, VARA FM)?'))return;
+  try{
+    await cpost('/api/shutdown');
+    document.body.innerHTML='<div style="display:flex;align-items:center;justify-content:center;height:100vh;font-family:system-ui;color:#64748b;font-size:18px">HamLink has been stopped.</div>';
+  }catch(e){
+    document.body.innerHTML='<div style="display:flex;align-items:center;justify-content:center;height:100vh;font-family:system-ui;color:#64748b;font-size:18px">HamLink has been stopped.</div>';
+  }
 }
 
 async function saveSett(){
@@ -4247,6 +4467,7 @@ async function saveSett(){
       poll_interval:parseInt(document.getElementById('cPatPoll').value)||30,
       home_tactical:document.getElementById('cPatHomeTac').value.trim().toUpperCase(),
       traveler_tactical:document.getElementById('cPatTravTac').value.trim().toUpperCase(),
+      position_reports:document.getElementById('cPatPosReports').classList.contains('on'),
       rf_fallback:document.getElementById('cPatRfFallback').classList.contains('on'),
       rf_gateway:document.getElementById('cPatRfGw').value.trim().toUpperCase(),
       varafm_addr:document.getElementById('cPatVaraAddr').value.trim()||'localhost:8300',
@@ -4371,6 +4592,24 @@ function detectLocation(){
     },
     {timeout:10000,enableHighAccuracy:false}
   );
+}
+
+function updateBcnRfWarn(){
+  var on=document.getElementById('cBcnRf').classList.contains('on');
+  document.getElementById('bcnRfWarn').style.display=on?'block':'none';
+}
+function updateBcnRfAvail(){
+  var smOn=document.getElementById('cSmOn').classList.contains('on');
+  var rfTgl=document.getElementById('cBcnRf');
+  if(!smOn){
+    rfTgl.classList.remove('on');
+    rfTgl.style.opacity='0.4';
+    rfTgl.style.pointerEvents='none';
+  }else{
+    rfTgl.style.opacity='1';
+    rfTgl.style.pointerEvents='auto';
+  }
+  updateBcnRfWarn();
 }
 
 function detectBeaconLocation(){
@@ -4501,19 +4740,27 @@ function ui(d){
   const sitBtn=document.getElementById('btnSitrep');
   if(sitBtn)sitBtn.style.display=(d.config.bbs_directory_resolved)?'':'none';
 
-  // Position card
+  // Position card — show most recent position from APRS or Winlink
   const lc=document.getElementById('locCard');
-  if(d.aprs_last_position){
-    const p=d.aprs_last_position;
+  var pos=null, posSrc='';
+  if(d.aprs_last_position&&d.winlink_last_position){
+    // Show whichever is more recent
+    var aT=new Date(d.aprs_last_position.time).getTime()||0;
+    var wT=new Date(d.winlink_last_position.time).getTime()||0;
+    if(wT>aT){pos=d.winlink_last_position;posSrc='Winlink'}
+    else{pos=d.aprs_last_position;posSrc='APRS'}
+  }else if(d.aprs_last_position){pos=d.aprs_last_position;posSrc='APRS'}
+  else if(d.winlink_last_position){pos=d.winlink_last_position;posSrc='Winlink'}
+  if(pos){
     lc.style.display='block';
-    document.getElementById('locTitle').textContent=`${d.config.operator_name||p.callsign} — Last Position`;
-    try{document.getElementById('locTime').textContent=new Date(p.time).toLocaleString()}catch(x){}
-    let det=`${p.lat.toFixed(4)}, ${p.lon.toFixed(4)}`;
-    if(p.altitude)det+=` · ${Math.round(p.altitude)}m alt`;
-    if(p.speed)det+=` · ${Math.round(p.speed)} km/h`;
-    if(p.comment)det+=` · ${p.comment}`;
+    document.getElementById('locTitle').textContent=`${d.config.operator_name||pos.callsign} — Last Position (${posSrc})`;
+    try{document.getElementById('locTime').textContent=new Date(pos.time).toLocaleString()}catch(x){}
+    let det=`${pos.lat.toFixed(4)}, ${pos.lon.toFixed(4)}`;
+    if(pos.altitude)det+=` · ${Math.round(pos.altitude)}m alt`;
+    if(pos.speed)det+=` · ${Math.round(pos.speed)} km/h`;
+    if(pos.comment)det+=` · ${pos.comment}`;
     document.getElementById('locDetails').textContent=det;
-    document.getElementById('locLink').href=`https://www.google.com/maps?q=${p.lat},${p.lon}`;
+    document.getElementById('locLink').href=`https://www.google.com/maps?q=${pos.lat},${pos.lon}`;
   }else{lc.style.display='none'}
 
   // Status card
@@ -4564,12 +4811,13 @@ function ui(d){
 
 function dismiss(id){
   dismissedIds.add(id);
+  cpost('/api/acknowledge',{id:id});
   const d=window._d;
   if(d){
+    d.pending=d.pending.filter(a=>a.id!==id);
     const remaining=d.pending.filter(a=>!dismissedIds.has(a.id));
     if(remaining.length===0){
       stopAlarm();
-      cpost('/api/stop_alarm');
     }
   }
   render();
@@ -4578,7 +4826,7 @@ function dismissAll(){
   const d=window._d;if(!d)return;
   d.pending.forEach(a=>dismissedIds.add(a.id));
   stopAlarm();
-  cpost('/api/stop_alarm');
+  cpost('/api/acknowledge_all');
   render();
 }
 

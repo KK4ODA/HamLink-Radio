@@ -2,7 +2,9 @@
 
 **Version 1.0 | April 2026**
 
-HamLink Radio is a family emergency communications application for licensed amateur radio operators. It monitors multiple radio channels (VarAC, APRS, and Winlink) for check-in messages from a traveling family member and enables the home station operator to send replies, post situation reports, and receive phone notifications — all from a simple web interface.
+HamLink Radio is a family emergency communications application for licensed amateur radio operators. It monitors multiple radio channels (VarAC, APRS, and Winlink) for check-in messages from a traveling family member and enables the home station operator to send replies via the internet, post situation reports for VarAC pickup or relay, and receive phone notifications via the internet — all from a simple web interface.
+
+> **Notice:** This application is designed for use under United States FCC Part 97 amateur radio regulations. Operation of this application outside the United States requires the operator to verify compliance with their country's amateur radio regulations, which may differ significantly from FCC rules.
 
 ---
 
@@ -28,7 +30,7 @@ HamLink Radio is designed for two people:
 
 - **The traveler** — A licensed ham radio operator who is away from home (road trip, backcountry, deployment, disaster response). They send check-in messages from their portable or mobile radio using VarAC, APRS, or Winlink.
 
-- **The home station operator** — A family member at home (spouse, parent, etc.) who may or may not hold a ham license. They use HamLink Radio's web interface on a PC or phone to monitor for messages, send replies, and post family status reports.
+- **The home station operator** — A family member at home (spouse, parent, etc.) who may or may not hold a ham license. They use HamLink Radio's web interface on a PC or phone to monitor for messages, send internet replies, and post family status reports. If the home station operator does not hold a license, only replies via internet channels (APRS-IS, Winlink telnet) are compliant without a control operator present — RF transmissions (APRS via Soundmodem, VARA FM) require a licensed control operator to be present or supervising (see [FCC Compliance](#9-fcc-compliance)).
 
 The licensed operator (the traveler) is ultimately responsible for all transmissions made from the home station, including those initiated through this application. See [FCC Compliance](#9-fcc-compliance) for details.
 
@@ -101,13 +103,13 @@ To access HamLink Radio from a phone or tablet on the same Wi-Fi network, use th
 
 ### Regulatory Compliance Notice
 
-On first launch, you will see a compliance notice with three acknowledgements:
+On first launch, you will see a compliance notice explaining the FCC rules that apply to HamLink Radio. The notice covers:
 
-1. **Amateur radio license** — Confirms you understand a valid FCC amateur radio license is required
-2. **Third-party communication rules** — Confirms you understand FCC rules on third-party traffic
-3. **Emergency use and disclaimers** — Confirms you understand the app's limitations
+- **Station license requirements** — A valid FCC amateur radio license is required for the station operator, and the licensee is responsible for all transmissions made through the app.
+- **Third-party communications (97.115)** — When an unlicensed person (such as a family member) uses the app, this constitutes third-party communications. The notice explains the five key requirements: (1) a licensed control operator must be designated, (2) the data emission exception under 97.115(c) that permits third-party traffic under automatic control for RTTY and data emissions, (3) messages must be personal in nature, (4) international third-party traffic rules, and (5) station identification requirements.
+- **Emergency exception (97.403)** — In situations involving immediate safety of life or property, any means of communication may be used.
 
-You must check all three boxes and click "I Understand & Accept" to proceed. This screen appears once per browser.
+You must check all three acknowledgement boxes and click "I Understand & Accept" to proceed. This screen appears once per browser.
 
 ### Welcome Screen
 
@@ -285,38 +287,49 @@ Tap "Got it" to acknowledge and move to history. Tap "Reply" to respond.
 
 ### 6.3 Sending Messages
 
+By default, all replies from the home station go via the internet. RF fallback is available when internet is down, but is blocked by default and only permitted for: (1) a licensed amateur radio operator who is present at or supervising the station, (2) data transmissions at 500 Hz bandwidth or below under automatic control (FCC Part 97.221), or (3) emergencies involving immediate safety of life or property (FCC Part 97.403).
+
 Click "Send Message" or "Reply" on any alert. The compose box opens with:
 
 - **Quick Reply Buttons** — Your pre-written replies (one tap to select)
 - **Text Area** — Type a custom message
 - **Channel Checkboxes** — Select which channels to send via:
-  - **APRS (internet)** or **APRS (RF)** — Short messages up to 67 characters. The label dynamically shows whether the message will go via APRS-IS (internet) or Soundmodem (RF), depending on your current connection state.
-  - **Winlink (internet)** or **Winlink (internet / RF fallback)** — Full email messages. Shows RF fallback status if configured.
-  - **VarAC (RF)** — Always an RF transmission via peer-to-peer digital link.
+  - **APRS (internet)** or **APRS (RF)** — Short messages up to 67 characters. The label dynamically shows whether the message will go via APRS-IS (internet) or Soundmodem (RF), depending on your current connection state. When in RF mode, APRS exceeds the 500 Hz bandwidth limit and is blocked by default.
+  - **Winlink (internet)** or **Winlink (internet / RF fallback)** — Full email messages. Shows RF fallback status if configured. When RF fallback activates, Winlink via VARA FM exceeds the 500 Hz bandwidth limit and is blocked by default.
+  - **VarAC (queued to outbox)** — Replies are saved to the VarAC outbox database. The message is not transmitted immediately — it will be sent by VarAC when the remote operator next connects to your station. No RF transmission occurs at the time of sending.
 
-Channels that involve RF transmission are labeled in amber. You can select multiple channels to maximize delivery chances.
+Channels that would transmit via RF are labeled in amber. VarAC is not labeled in amber because replies are queued locally, not transmitted directly.
 
-**RF transmission confirmation:** If any selected channel involves an RF transmission (VarAC, APRS via Soundmodem), a confirmation dialog appears before sending. This dialog cites:
-- **FCC Part 97.115** — Third-party traffic requires a licensed control operator
-- **FCC Part 97.403** — Emergency exception: in situations involving immediate safety of life or property, any means of communication may be used
+**Non-compliant RF blocking:** If any selected channel would transmit via RF with bandwidth exceeding 500 Hz (APRS via Soundmodem, Winlink via VARA FM), a **blocking modal** appears. These modes are not compliant under automatic control (FCC Part 97.221) and are blocked by default. To proceed, the operator must confirm one of:
+- **"I am a licensed operator"** — Confirms they hold a license and are present at or supervising the station
+- **"Emergency — immediate safety of life or property"** — Invokes the FCC Part 97.403 emergency exception
 
-Messages sent via internet-only channels (APRS-IS, Winlink telnet) do not trigger the RF confirmation, as they do not involve amateur radio transmissions from your station.
+Messages sent via internet-only channels (APRS-IS, Winlink telnet) and VarAC outbox replies do not trigger any RF confirmation, as they do not involve immediate amateur radio transmissions from your station.
 
 **APRS length warning:** If your message exceeds 67 characters, a red warning appears. APRS messages are truncated at 67 characters.
 
 ### 6.4 Quick Replies from Your Phone
 
-If Pushover quick replies are enabled in Settings (off by default), incoming message notifications on your phone include clickable reply links. Tapping a link opens a confirmation page showing:
-- The message that will be sent
-- A reminder that amateur radio transmissions require a valid license (FCC Part 97.115)
-- An emergency exception notice (FCC Part 97.403)
-- A "Confirm & Send" button — a second tap is required to actually transmit
+If Pushover quick replies are enabled in Settings (off by default), incoming message notifications on your phone include clickable reply links. Tapping a link opens a confirmation page. The page content depends on the channel:
 
-This two-step process prevents accidental transmissions.
+- **VarAC** — Shows "Confirm Message" with a note that the message will be queued to the VarAC outbox and transmitted when the remote operator next connects. No RF warning is shown because no immediate RF transmission occurs.
+- **APRS (internet)** — Shows "Confirm Transmission" with a note that the message will be sent via APRS-IS (internet) with no RF transmission from your station.
+- **APRS (RF fallback)** — If internet is down and APRS would fall back to Soundmodem RF, the page shows a **non-compliant RF warning** explaining that APRS via Soundmodem exceeds the 500 Hz bandwidth limit (97.221) and is blocked by default. The operator must confirm they are licensed or invoke the emergency exception (97.403) to proceed.
+
+This two-step process prevents both accidental and non-compliant transmissions.
 
 ### 6.5 Message Log
 
 Click "View Log" at the bottom of the main screen to see a complete history of all incoming and outgoing messages in chronological order. The log is saved to `message_log.csv` and survives application restarts.
+
+### 6.6 Stopping HamLink
+
+To stop HamLink and all associated programs, open Settings and click the **Stop HamLink** button at the bottom. After confirmation, HamLink will:
+- Stop all background threads (APRS listener, KISS monitor, beacon)
+- Terminate VarAC, Soundmodem, Pat, and VARA FM if they were launched by HamLink
+- Shut down the web server
+
+The browser will display "HamLink has been stopped." You can also stop HamLink by pressing Ctrl+C in the terminal window — this triggers the same cleanup process.
 
 ---
 
@@ -335,8 +348,7 @@ A Sitrep (Situation Report) is a structured status update posted to the VarAC BB
 5. HamLink:
    - Saves the sitrep as a text file in the VarAC BBS folder
    - Renames the previous sitrep to archive it
-   - Sends a VarAC broadcast to all stations on the current frequency
-   - Sends an APRS bulletin announcing the sitrep
+   - Sends a 500Hz VarAC broadcast to all stations on the current frequency
 
 ### Sitrep Fields
 
@@ -384,7 +396,7 @@ REMARKS:    Tree down on Elm St, roads passable
 
 ### VarAC Broadcast
 
-When a sitrep is posted, HamLink automatically sends a VarAC broadcast to all stations on the current frequency:
+When a sitrep is posted, HamLink automatically sends a 500 Hz VarAC broadcast to all stations on the current frequency. This transmission is compliant under automatic control because VARA HF in 500 Hz mode satisfies the 97.221 bandwidth limit, and the data emission qualifies for the 97.115(c) third-party exception:
 
 ```
 SITREP#005 on BBS QSY 13:30Z 14.105 pls connect & relay
@@ -397,29 +409,13 @@ This broadcast:
 
 This is the most targeted announcement — it hits exactly the people who are already running VarAC and capable of connecting to your BBS.
 
-### APRS Bulletin Announcement
-
-In addition to the VarAC broadcast, HamLink sends an APRS bulletin to reach a wider audience:
-
-```
-SITREP#003 KK4ODA BBS 7.105MHz QSY 13:30Z 14.105 pls relay
-```
-
-This bulletin:
-- Is transmitted via both APRS-IS (internet) and RF (Soundmodem)
-- Includes the current VarAC frequency so hams know where to connect
-- Includes the next scheduled frequency change (QSY) time and frequency
-- Reaches all APRS-capable stations in the area
-- Visible on [aprs.fi](https://aprs.fi) raw packets view
-
 ### Crowdsourced Relay
 
 The sitrep system enables a powerful relay workflow:
 
-1. Home station posts sitrep to BBS, sends VarAC broadcast, and sends APRS bulletin
+1. Home station posts sitrep to BBS and sends VarAC broadcast
 2. VarAC operators on the same frequency see the broadcast immediately
-3. Other hams see the APRS bulletin on their APRS client or radio
-4. They connect to the home station's VarAC BBS and download the sitrep
+3. They connect to the home station's VarAC BBS and download the sitrep
 5. If they can reach the traveler on any band, they relay the information
 6. The traveler gets the full family status update even without direct contact
 
@@ -442,6 +438,8 @@ The sitrep system enables a powerful relay workflow:
 3. Family member taps a quick reply: "Got your message, all is well here!"
 4. Reply queued to VarAC outbox for next contact
 
+**Compliance notes:** With internet available, APRS replies go via APRS-IS (internet) and Winlink replies go via telnet — no RF transmission, so no bandwidth or control operator concerns. VarAC replies are posted to the VarAC outbox and need to be picked up by the remote operator when they next connect — the actual RF transmission is handled by VarAC itself via VARA HF 500 Hz mode, which is compliant under automatic control (97.221). If the family member is unlicensed, they are operating as a third party under 97.115, and the licensed traveler serves as the remote control operator.
+
 ### 8.2 Hurricane / Natural Disaster
 
 **Scenario:** A hurricane is approaching. The traveler is deployed for disaster response. The family at home needs to communicate status.
@@ -456,10 +454,14 @@ The sitrep system enables a powerful relay workflow:
 1. Before the storm: Post sitrep "All OK, preparing to shelter in place"
 2. During: Post sitrep with utility status: "Power out since 1400Z, on generator"
 3. If evacuating: Post sitrep with new location (GPS or What3Words) and relocation status
-4. Each sitrep automatically sends a VarAC broadcast to all stations on frequency and an APRS bulletin to the wider ham community
+4. Each sitrep automatically sends a 500 Hz VarAC broadcast to all stations on frequency
 5. Nearby VarAC operators connect to your BBS and relay the sitrep to the traveler
-6. If internet goes down, APRS messages continue via RF through local digipeaters
+6. If internet goes down, APRS replies can fall back to RF via Soundmodem — see compliance note below
 7. Winlink messages route via VARA FM RF gateway to reach the traveler's inbox
+
+**Compliance notes:** While internet is available, APRS and Winlink replies go via internet (APRS-IS and telnet) with no RF compliance concerns. VarAC replies are posted to the VarAC outbox and need to be picked up by the remote operator when they next connect — the actual RF transmission is handled by VarAC itself via VARA HF 500 Hz mode, which is compliant under automatic control (97.221). Sitrep broadcasts also use VARA HF 500 Hz mode.
+
+When internet goes down and RF fallback activates, APRS replies would be sent via Soundmodem and Winlink via VARA FM — both exceed the 500 Hz bandwidth limit and **are not compliant under automatic control** (97.221). HamLink blocks these transmissions by default and requires the operator to confirm they are a licensed amateur radio operator or to invoke the emergency exception (97.403) before proceeding. 
 
 ### 8.3 Off-Grid Backcountry Trip
 
@@ -473,9 +475,11 @@ The sitrep system enables a powerful relay workflow:
 **Workflow:**
 1. Traveler sends brief APRS messages when they have signal: "Day 3, at summit, all good"
 2. Home station receives via APRS-IS and alerts the family
-3. Family replies via APRS: "Miss you! Dog learned a new trick"
+3. Family replies via APRS-IS: "Miss you! Dog learned a new trick"
 4. If APRS message doesn't reach directly, the mailbox stores it for later retrieval
-5. Traveler can also check in via Winlink from a campsite with longer messages
+5. Traveler can also check in via Winlink from a campsite with longer messages. Family replies are via Pat Telnet.
+
+**Compliance notes:** APRS replies go via APRS-IS (internet) and Winlink via telnet — both internet-only paths with no RF compliance concerns. VarAC replies are posted to the VarAC outbox and need to be picked up by the remote operator when they next connect — the actual RF transmission is handled by VarAC itself via VARA HF 500 Hz mode, which is compliant under automatic control (97.221). If the family member is unlicensed, they are a third party under 97.115, and all internet-only replies are compliant without a control operator present.
 
 ### 8.4 Emergency Family Relay via BBS
 
@@ -484,12 +488,13 @@ The sitrep system enables a powerful relay workflow:
 **Workflow:**
 1. Family member posts a sitrep describing the situation at home
 2. VarAC broadcast goes out to all stations on frequency: "SITREP#005 on BBS pls connect & relay"
-3. APRS bulletin also goes out: "SITREP#005 KK4ODA BBS 7.105MHz pls relay"
-4. A nearby ham (say, K5OOM) sees the VarAC broadcast or APRS bulletin
-5. K5OOM connects to the home station's VarAC BBS and downloads the sitrep
-6. K5OOM is on a different band where they can reach the traveler
-7. K5OOM relays the family's status to the traveler
-8. The traveler now knows their family is safe and what their situation is
+3. A nearby ham (say, K5XYM) sees the VarAC broadcast
+4. K5XYM connects to the home station's VarAC BBS and downloads the sitrep
+5. K5XYM is on a different band where they can reach the traveler
+6. K5XYM relays the family's status to the traveler
+7. The traveler now knows their family is safe and what their situation is
+
+**Compliance notes:** The VarAC sitrep broadcast uses VARA HF 500 Hz mode, which is compliant under automatic control (97.221) and satisfies the data emission exception for third-party traffic (97.115(c)). The BBS file serving also operates via VARA HF 500 Hz. No internet connection is required for this workflow — it is fully RF-compliant.
 
 ---
 
@@ -499,7 +504,7 @@ HamLink Radio is designed for use by licensed amateur radio operators under FCC 
 
 ### 9.1 Control Operator Responsibility (97.7, 97.103)
 
-Every amateur station must have a control operator — the person responsible for the proper operation of the station. The control operator must hold a valid amateur radio license of the appropriate class.
+Every amateur station must have a control operator — the person responsible for the station's proper operation. The control operator must hold a valid amateur radio license of the appropriate class.
 
 **What this means for HamLink Radio:** The licensed operator (typically the traveler) is responsible for all transmissions made from the home station, including those initiated through this application by a family member. If the family member does not hold their own amateur license, they are acting as a third party (see 97.115 below) and the licensed operator must ensure compliance.
 
@@ -507,11 +512,14 @@ Every amateur station must have a control operator — the person responsible fo
 
 An amateur station may transmit messages on behalf of a third party (a person who is not a licensed amateur) to any station within the jurisdiction of the United States. The control operator must ensure compliance with all rules.
 
+Under 97.115(c), no station may transmit third-party communications while being automatically controlled **except** a station transmitting a RTTY or data emission. All HamLink Radio transmissions use data modes (APRS AX.25 packets, VARA modem data, Winlink data), which satisfies the data emission exception. However, the 97.221 bandwidth limitation (500 Hz) must also be met for automatic control — see [Automatic Control](#95-automatic-control-97109-97221) for which modes comply.
+
 **What this means for HamLink Radio:** A non-licensed family member may use HamLink Radio to send replies and sitreps, but:
 - The licensed operator must have authorized this use
 - The licensed operator is responsible for the content of all transmissions
 - All messages must comply with FCC content rules
 - For international third-party traffic, the destination country must have a third-party traffic agreement with the United States
+- Third-party messages satisfy the data emission exception (97.115(c)), but only VARA HF 500 Hz mode also meets the 97.221 bandwidth limit for automatic control — APRS via Soundmodem and VARA FM require a licensed control operator present or supervising
 
 ### 9.3 Station Identification (97.119)
 
@@ -536,21 +544,26 @@ Amateur stations must not transmit:
 **What this means for HamLink Radio:**
 - All messages must be personal, non-commercial family communications
 - No encryption is used — all messages are transmitted in the clear
-- Sitreps and APRS bulletins are addressed to specific parties or the amateur community, not the general public
+- Sitreps are addressed to specific parties or the amateur community, not the general public
 - The licensed operator should instruct family members on appropriate content
 
 ### 9.5 Automatic Control (97.109, 97.221)
 
-Automatic control is permitted for digital stations on certain frequencies. The control operator does not need to be physically present at the control point, but must ensure compliance with all rules.
+Automatic control is permitted for digital stations on certain frequencies. The control operator does not need to be physically present at the control point, but must ensure compliance with all rules. Under 97.221, no transmission from an automatically controlled digital station may occupy a bandwidth of more than 500 Hz. This limits which modes may be used under automatic control:
+
+- **VARA HF (500 Hz mode)** — Compliant. Must be configured to the 500 Hz bandwidth mode. Wider VARA HF modes (2300 Hz) exceed this limit and must not be used under automatic control.
+- **APRS via Soundmodem (1200-baud AFSK)** — **Not compliant.** The occupied bandwidth exceeds 500 Hz. APRS RF transmissions must not be made under automatic control.
+- **VARA FM** — **Not compliant.** The occupied bandwidth typically exceeds 500 Hz. VARA FM transmissions must not be made under automatic control.
 
 **What this means for HamLink Radio:**
-- APRS beacons are transmitted automatically at configured intervals — this is standard practice and permitted on APRS frequencies
-- APRS bulletins and message replies are initiated by a human operator (the family member) through the web interface, not automatically triggered
-- The compose box clearly labels each channel as **(internet)** or **(RF)** so the operator knows which path involves a radio transmission
-- RF transmissions (VarAC, APRS via Soundmodem) require a confirmation step citing FCC Part 97.115 and 97.403 before the message is sent
-- Internet-only transmissions (APRS-IS, Winlink telnet) do not trigger the RF confirmation since they do not involve amateur radio transmissions from the home station
-- Pushover quick reply links (when enabled) require a two-step confirmation before transmitting, with licensing and emergency exception language displayed
-- VarAC BBS serves files to connecting stations — the BBS operates under VarAC's own automatic control provisions
+- APRS and VARA FM RF transmissions require a licensed control operator to be present or supervising — they cannot be operated under automatic control due to the 500 Hz bandwidth limitation
+- APRS and Winlink message replies are initiated by a human operator (the family member) through the web interface, not automatically triggered
+- VarAC replies are queued to the VarAC outbox — no immediate RF transmission occurs; the message is sent by VarAC when the remote operator connects
+- The compose box clearly labels each channel as **(internet)**, **(queued to outbox)**, or **(RF)** so the operator knows which path the message will take
+- Non-compliant RF transmissions (APRS via Soundmodem, Winlink via VARA FM — both exceeding 500 Hz) are blocked by default and require the operator to confirm they are licensed or invoke the emergency exception (97.403) before proceeding
+- Internet-only transmissions (APRS-IS, Winlink telnet) and VarAC outbox replies do not trigger any RF confirmation
+- VarAC sitrep broadcasts and BBS file serving operate via VARA HF 500 Hz mode, which is compliant under automatic control
+- Third-party communications under automatic control are permitted for compliant modes because all HamLink transmissions use data emissions, satisfying the 97.115(c) exception
 - The control operator should be reachable and able to shut down the station if needed
 
 ### 9.6 Emergency Communications (97.403, 97.405)
@@ -561,7 +574,7 @@ An amateur station may use any means of radio communications at its disposal to 
 - Normal operating restrictions may be relaxed when necessary for life safety
 - The sitrep system is designed for exactly this purpose — communicating family welfare status during emergencies
 - RF fallback (Soundmodem, VARA FM) ensures communications continue when internet infrastructure fails
-- APRS bulletins requesting relay assistance are appropriate during emergencies
+- APRS messages requesting relay assistance are appropriate during emergencies
 
 ### 9.7 Content Guidelines for Family Members
 
@@ -606,7 +619,6 @@ If the traveler is operating from outside the United States:
 |---------|----------|
 | "APRS send failed" | Check internet connection. Verify the APRS-IS passcode (use "Calculate" button). |
 | RF APRS not transmitting | Ensure Soundmodem is running and the KISS port matches. Check that your radio PTT is working. |
-| Bulletin not appearing on aprs.fi | Check `https://aprs.fi/?c=raw&call=YOURCALL` for raw packets. The bulletin board page may have display delays. |
 | Passcode incorrect | Click "Calculate" in APRS settings to auto-generate. The passcode is derived from your base callsign (without SSID). |
 
 ### Pushover Issues

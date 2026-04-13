@@ -183,10 +183,17 @@ start /min "" cmd /c "timeout /t 3 /nobreak >nul && start http://127.0.0.1:5000 
 :: Run the monitor from the script's directory
 cd /d "%~dp0"
 python monitor.py
+set EXIT_CODE=%ERRORLEVEL%
 
-:: If we get here, monitor exited
+:: If exit code is 0 (clean shutdown via UI), close the window silently
+if %EXIT_CODE%==0 (
+  endlocal
+  exit
+)
+
+:: Otherwise (crash or Ctrl+C), show message and pause so user can read errors
 echo.
-echo  Monitor has stopped.
+echo  Monitor has stopped unexpectedly (exit code %EXIT_CODE%).
 echo.
 pause
 endlocal
