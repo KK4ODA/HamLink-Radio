@@ -203,7 +203,7 @@ APRS (Automatic Packet Reporting System) enables short messages via internet (AP
 | **APRS-IS Server** | Server address. Default: `rotate.aprs2.net`. For North America: `noam.aprs2.net`. |
 | **APRS-IS Port** | Server port. Default: `14580`. |
 | **RF Fallback** | If enabled and internet is unavailable, APRS messages are sent via RF through Soundmodem. |
-| **Mailbox (Store & Forward)** | If enabled, copies of outgoing messages are sent to the APRS mailbox system for later retrieval. |
+| **Mailbox (Store & Forward)** | If enabled, copies of outgoing messages are sent to the APRS MAIL bot for later retrieval by the traveler. Works via both internet (APRS-IS) and RF (Soundmodem via iGates). |
 
 ### 5.7 Position Beacon
 
@@ -324,6 +324,12 @@ Channels that would transmit via RF are labeled in amber. VarAC is not labeled i
 Messages sent via internet-only channels (APRS-IS, Winlink telnet) and VarAC outbox replies do not trigger any RF confirmation, as they do not involve immediate amateur radio transmissions from your station.
 
 **APRS length warning:** If your message exceeds 67 characters, a red warning appears. APRS messages are truncated at 67 characters.
+
+**Sent message tracking:** Sent messages appear in "Previous Messages" with an orange "Sent" badge. For APRS messages, the card updates with delivery status:
+- **"✓ Delivered to CALLSIGN"** — The recipient's station acknowledged receipt (card border turns green)
+- **"📬 Stored in APRS mailbox"** — The APRS MAIL bot confirmed the message is stored for later retrieval
+
+A toast notification also appears when a delivery acknowledgment is received.
 
 ### 6.4 Quick Replies from Your Phone
 

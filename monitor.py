@@ -111,19 +111,34 @@ def log_message(alert_dict, direction="incoming"):
     except Exception as e:
         log.warning("Failed to write message log: %s", e)
 
-def log_reply(to_call, message):
-    """Log an outgoing reply to the CSV."""
+def log_reply(to_call, message, channel=""):
+    """Log an outgoing reply to the CSV and add to dashboard history."""
+    now_utc = datetime.now(timezone.utc).isoformat()
     try:
         _init_log_file()
         with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow([
-                datetime.now(timezone.utc).isoformat(),
+                now_utc,
                 "reply", "", "", to_call,
                 "Reply", message, False, "", "", "outgoing",
             ])
     except Exception as e:
         log.warning("Failed to log reply: %s", e)
+    # Add to dashboard history so sent messages appear in Previous Messages
+    reply_id = f"sent-{to_call}-{int(time.time())}"
+    with slock:
+        state["history"].append({
+            "id": reply_id, "type": "sent",
+            "time": now_utc,
+            "from_call": "", "from_name": "You",
+            "to_callsign": to_call,
+            "subject": "",
+            "message": message,
+            "channel": channel,
+            "urgent": False,
+            "friendly_time": "",
+        })
 
 # ---------------------------------------------------------------------------
 # Config
@@ -217,7 +232,9 @@ state = {
     "reply_status": None,
     "aprs_connected": False, "aprs_error": None,
     "kiss_connected": False, "kiss_error": None,
-    "pat_connected": False, "pat_error": None, "pat_last_check": None,
+    "pat_connected": False, "pat_error": None, "pat_last_check": None, "pat_next_sync": None, "pat_using_rf": False,
+    "aprs_last_ack": None,
+    "internet_up": True,
     "aprs_last_position": None,
     "winlink_last_position": None,
     "alarm_silenced": False,
@@ -404,8 +421,29 @@ def _process_aprs_packet(packet):
             addresse = packet.get("addresse", "").strip()
             msgno = packet.get("msgNo", "") or packet.get("msgno", "")
 
-            # Skip empty, ACKs, REJs
-            if not msg_text or msg_text.lower().startswith("ack") or msg_text.lower().startswith("rej"):
+            # Handle ACKs — track delivery confirmation
+            response = packet.get("response", "")
+            if response == "ack" or (msg_text and msg_text.lower().startswith("ack")):
+                acked_msgno = msgno or (msg_text[3:].strip() if msg_text else "")
+                if acked_msgno:
+                    log.info("APRS ACK received from %s for msg# %s", from_call, acked_msgno)
+                    now_utc = datetime.now(timezone.utc).isoformat()
+                    with slock:
+                        state["aprs_last_ack"] = {
+                            "from": from_call,
+                            "msgno": acked_msgno,
+                            "time": now_utc,
+                        }
+                        # Tag the most recent sent APRS message as delivered
+                        for h in reversed(state["history"]):
+                            if h.get("type") == "sent" and h.get("channel") == "aprs":
+                                h["delivered"] = True
+                                h["delivered_by"] = from_call
+                                h["delivered_time"] = now_utc
+                                break
+                return
+            # Skip empty, REJs
+            if response == "rej" or not msg_text or msg_text.lower().startswith("rej"):
                 return
 
             # Skip messages from APRS system bots (automated confirmations, not human messages)
@@ -417,19 +455,15 @@ def _process_aprs_packet(packet):
                 # Send ACK so the bot stops retrying
                 if msgno:
                     _aprs_send_ack(from_call, msgno)
-                # Store as a system notification (no alarm, just confirmation)
+                # Update the most recent sent APRS message with bot confirmation
                 now_utc = datetime.now(timezone.utc).isoformat()
-                sys_id = f"sys-{from_call}-{msgno or int(time.time())}"
                 with slock:
-                    state["history"].append({
-                        "id": sys_id, "type": "system",
-                        "time": now_utc, "from_call": from_call,
-                        "from_name": from_call, "to": addresse,
-                        "subject": "", "message": msg_text,
-                        "urgent": False, "friendly_time": _friendly_time(now_utc),
-                    })
-                    state["reply_status"] = {"time": now_utc, "to": addresse,
-                                             "message": msg_text[:100], "status": "confirmed"}
+                    for h in reversed(state["history"]):
+                        if h.get("type") == "sent" and h.get("channel") == "aprs":
+                            h["mail_bot_confirmed"] = True
+                            h["mail_bot_msg"] = msg_text
+                            h["mail_bot_time"] = now_utc
+                            break
                 return
 
             # Only messages addressed to us (home SSID or any traveler SSID)
@@ -515,7 +549,7 @@ def aprs_send_message(to_call, message):
         pkt = f"{home}>APRS,TCPIP*::{padded}:{msg}{{{msgno}"
         ok = _aprs_send_raw(pkt)
     if ok:
-        log_reply(to_call, f"[APRS] {msg}")
+        log_reply(to_call, f"[APRS] {msg}", channel="aprs")
         # Also send to MAIL bot for store-and-forward if enabled
         with cfglock:
             use_mailbox = config.get("aprs", {}).get("use_mailbox", False)
@@ -526,8 +560,13 @@ def aprs_send_message(to_call, message):
             mail_dest = to_call.strip()
             mail_msg = f"@{mail_dest} {msg}"[:67]
             mail_msgno = str((int(time.time()) + 1) % 1000)
-            mail_pkt = f"{home}>APRS,TCPIP*::{mail_padded}:{mail_msg}{{{mail_msgno}"
-            _aprs_send_raw(mail_pkt)
+            if use_rf:
+                # Send MAIL bot message via RF so iGates can relay it
+                rf_mail_pkt = f"{home}>APRS,WIDE1-1,WIDE2-1::{mail_padded}:{mail_msg}{{{mail_msgno}"
+                _aprs_send_via_kiss(rf_mail_pkt)
+            else:
+                mail_pkt = f"{home}>APRS,TCPIP*::{mail_padded}:{mail_msg}{{{mail_msgno}"
+                _aprs_send_raw(mail_pkt)
             log.info("APRS mailbox copy sent to MAIL for %s", mail_dest)
         return True, ""
     return False, "Failed to send"
@@ -609,7 +648,14 @@ def _aprs_listener_loop():
             state["aprs_connected"] = False
             state["aprs_error"] = f"Reconnecting in {backoff}s..."
         log.info("APRS-IS reconnecting in %d seconds...", backoff)
-        time.sleep(backoff)
+        # Sleep in short increments, checking internet so we reconnect quickly when it's back
+        for _ in range(backoff):
+            if not _aprs_running:
+                break
+            time.sleep(1)
+            if _check_internet(timeout=2):
+                log.info("Internet detected — reconnecting APRS-IS now")
+                break
         backoff = min(backoff * 2, 300)  # Double backoff, cap at 5 minutes
 
 
@@ -1259,6 +1305,30 @@ def _kiss_listener_loop():
                                 log.info("KISS RX [%d]: %s", rx_count, aprs_str[:80])
                             try:
                                 import aprslib
+                                # Skip packets from our exact home station callsign (digipeated back)
+                                # Only skip our SSID (e.g., KK4ODA-1), not the traveler's (e.g., KK4ODA-7)
+                                pkt_from = aprs_str.split(">")[0].strip().upper()
+                                with cfglock:
+                                    our_call = config.get("home_callsign", "").strip().upper()
+                                    our_ssid = config.get("aprs", {}).get("home_ssid", "-5")
+                                our_full = (our_call + our_ssid if our_ssid and not our_call.endswith(our_ssid)
+                                            else our_call).upper() if our_call else ""
+                                if our_full and pkt_from == our_full:
+                                    log.debug("KISS RX: skipping own packet from %s", pkt_from)
+                                    continue
+                                # Check for third-party packets (iGate relays)
+                                # Format: }CALL>PATH::DEST :payload
+                                info = aprs_str.split(":", 1)[1] if ":" in aprs_str else ""
+                                if info.startswith("}"):
+                                    inner = info[1:]  # Strip the } prefix
+                                    log.info("KISS RX: third-party packet, inner: %s", inner[:80])
+                                    try:
+                                        parsed = aprslib.parse(inner)
+                                        parsed["_via_rf"] = True
+                                        _process_aprs_packet(parsed)
+                                    except Exception as e3p:
+                                        log.info("KISS: third-party parse failed: %s (inner: %s)", e3p, inner[:60])
+                                    continue
                                 parsed = aprslib.parse(aprs_str)
                                 parsed["_via_rf"] = True
                                 _process_aprs_packet(parsed)
@@ -1673,7 +1743,7 @@ def pat_send_message(to_addr, subject, body):
             log.error("Pat compose failed: %s", err)
             return False, err
         log.info("Winlink message queued to %s: %s", to_addr, subject[:40])
-        log_reply(to_addr, f"[Winlink] {subject}: {body[:100]}")
+        log_reply(to_addr, f"[Winlink] {subject}: {body[:100]}", channel="winlink")
         return True, ""
     except subprocess.TimeoutExpired:
         proc.kill()
@@ -1834,6 +1904,12 @@ def _pat_poll_loop():
                 _winlink_check_position()
             else:
                 log.info("Winlink position check skipped (no internet)")
+            # Set next sync time for UI countdown
+            import time as _time
+            next_sync_epoch = _time.time() + sync_interval
+            with slock:
+                state["pat_next_sync"] = datetime.fromtimestamp(next_sync_epoch, tz=timezone.utc).isoformat()
+                state["pat_using_rf"] = use_rf
             # Between syncs, keep checking local inbox frequently
             elapsed = 0
             while elapsed < sync_interval and _pat_running:
@@ -2271,6 +2347,10 @@ def poll_loop():
         if _trim_counter >= 60:
             _trim_counter = 0
             _trim_memory()
+        # Check internet status every poll cycle
+        inet = _check_internet(timeout=2)
+        with slock:
+            state["internet_up"] = inet
         time.sleep(iv)
 
 MAX_HISTORY = 500
@@ -2527,9 +2607,13 @@ def api_status():
             "kiss_error": state["kiss_error"],
             "pat_connected": state["pat_connected"],
             "pat_error": state["pat_error"],
+            "pat_next_sync": state["pat_next_sync"],
+            "pat_using_rf": state["pat_using_rf"],
             "aprs_last_position": state["aprs_last_position"],
+            "aprs_last_ack": state["aprs_last_ack"],
             "winlink_last_position": state["winlink_last_position"],
             "alarm_silenced": state["alarm_silenced"],
+            "internet_up": state["internet_up"],
             "config": cfg_snap,
             "csrf_token": _csrf_token,
         })
@@ -2763,7 +2847,7 @@ def api_pushover_reply_send():
                     conn.commit()
                     conn.close()
                     result = f"Queued to VarAC outbox for {to_call}"
-                    log_reply(to_call, msg)
+                    log_reply(to_call, msg, channel="varac")
                 except Exception as e:
                     result = f"VarAC error: {e}"
             else:
@@ -2995,7 +3079,7 @@ def api_reply():
             }
 
         log.info("Reply queued to %s: %s", to_call, msg_text[:60])
-        log_reply(to_call, msg_text)
+        log_reply(to_call, msg_text, channel="varac")
         return jsonify({"ok": True, "to": to_call})
 
     except Exception as e:
@@ -4093,6 +4177,9 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
     <div class="conn" id="aprsConn" style="margin-top:4px"><div class="conn-dot off" id="aprsDot"></div><span id="aprsText">APRS off</span></div>
     <div class="conn" id="kissConn" style="margin-top:4px"><div class="conn-dot off" id="kissDot"></div><span id="kissText">RF off</span></div>
     <div class="conn" id="patConn" style="margin-top:4px"><div class="conn-dot off" id="patDot"></div><span id="patText">Winlink off</span></div>
+    <div id="rfCountdown" style="display:none;margin-top:10px;padding:8px 12px;background:rgba(0,0,0,0.05);border-radius:8px;font-size:12px;color:var(--text2)">
+      <span style="font-weight:600">Next RF Winlink check:</span> <span id="rfCountdownTime"></span>
+    </div>
   </div>
 
   <!-- LOCATION CARD -->
@@ -4152,6 +4239,9 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
       may initiate RF transmissions (FCC Part 97).
       In an emergency involving immediate safety of life or property, any means of communication
       may be used (97.403).
+      <br><br><strong>Note:</strong> VarAC does not transmit immediately — replies are saved to a local outbox
+      and delivered when the remote operator connects. No RF transmission occurs at the time of sending,
+      so VarAC is safe to use regardless of license status.
     </div>
     <div class="reply-send-row">
       <div class="reply-status" id="replyStatus"></div>
@@ -4283,13 +4373,15 @@ function _openComposeBox(chan){
   if(!aprsOn)document.getElementById('chkAprs').checked=false;
   if(!wlOn)document.getElementById('chkWinlink').checked=false;
   if(!varacOn)document.getElementById('chkVarac').checked=false;
-  // Update path labels (internet vs RF)
-  var aprsRf=d.config&&d.config.aprs&&d.config.aprs.rf_fallback&&d.kiss_connected&&!d.aprs_connected;
-  var aprsKiss=d.kiss_connected&&!d.aprs_connected;
-  document.getElementById('aprsPathLabel').textContent=aprsRf||aprsKiss?'(RF)':'(internet)';
-  document.getElementById('aprsPathLabel').style.color=aprsRf||aprsKiss?'#b45309':'var(--text3)';
-  var wlRf=d.config&&d.config.pat&&d.config.pat.rf_fallback;
-  document.getElementById('wlPathLabel').textContent=wlRf?'(internet / RF fallback)':'(internet)';
+  // Update path labels (internet vs RF) — use internet_up for reliable detection
+  var aprsRf=d.kiss_connected&&!d.internet_up;
+  var aprsKiss=d.kiss_connected&&!d.internet_up;
+  document.getElementById('aprsPathLabel').textContent=aprsRf?'(RF — no internet)':!d.internet_up?'(no internet)':'(internet)';
+  document.getElementById('aprsPathLabel').style.color=aprsRf||!d.internet_up?'#b45309':'var(--text3)';
+  // Winlink RF fallback: only active if configured AND internet is down
+  var wlRfConfigured=d.config&&d.config.pat&&d.config.pat.rf_fallback;
+  var wlRf=wlRfConfigured&&!d.internet_up;
+  document.getElementById('wlPathLabel').textContent=wlRf?'(RF — no internet)':wlRfConfigured?'(internet)':'(internet)';
   document.getElementById('wlPathLabel').style.color=wlRf?'#b45309':'var(--text3)';
   document.getElementById('varacPathLabel').textContent='(queued to outbox)';
   document.getElementById('varacPathLabel').style.color='var(--text3)';
@@ -4298,6 +4390,7 @@ function _openComposeBox(chan){
     var anyRf=false;
     // VarAC replies go to outbox only (no RF) — don't count as RF
     if(document.getElementById('chkAprs').checked&&(aprsRf||aprsKiss))anyRf=true;
+    if(document.getElementById('chkWinlink').checked&&wlRf)anyRf=true;
     document.getElementById('rfWarning').style.display=anyRf?'block':'none';
   }
   updateRfWarning();
@@ -4337,8 +4430,8 @@ function confirmAndSend(){
   // Classify selected channels: internet-only, non-compliant-RF, or outbox-only (VarAC)
   // VarAC replies go to outbox only — no RF transmission, no modal needed
   var d=window._d||{};
-  var aprsRf=d.kiss_connected&&!d.aprs_connected;
-  var wlRf=d.config&&d.config.pat&&d.config.pat.rf_fallback;
+  var aprsRf=d.kiss_connected&&!d.internet_up;
+  var wlRf=d.config&&d.config.pat&&d.config.pat.rf_fallback&&!d.internet_up;
   var sendAprs=document.getElementById('chkAprs').checked;
   var sendWl=document.getElementById('chkWinlink').checked;
   // Non-compliant RF: APRS via Soundmodem or Winlink via VARA FM
@@ -4428,11 +4521,16 @@ function speak(text,v){
   window.speechSynthesis.cancel();
   const u=new SpeechSynthesisUtterance(text);
   u.volume=v!==undefined?v:vol();u.rate=0.95;u.pitch=1.0;
-  // Prefer a natural-sounding voice
+  // Prefer offline/local voices that work without internet
   const voices=window.speechSynthesis.getVoices();
-  const preferred=voices.find(v=>v.lang.startsWith('en')&&v.name.includes('Female'))||
-                  voices.find(v=>v.lang.startsWith('en')&&!v.name.includes('Google'))||
-                  voices.find(v=>v.lang.startsWith('en'));
+  const localVoices=voices.filter(v=>v.localService&&v.lang.startsWith('en'));
+  const onlineVoices=voices.filter(v=>!v.localService&&v.lang.startsWith('en'));
+  // Use local voices first (work offline), fall back to online
+  const preferred=localVoices.find(v=>v.name.includes('Female'))||
+                  localVoices.find(v=>v.name.includes('Zira'))||
+                  localVoices[0]||
+                  onlineVoices.find(v=>v.name.includes('Female'))||
+                  onlineVoices[0];
   if(preferred)u.voice=preferred;
   window.speechSynthesis.speak(u);
 }
@@ -4899,9 +4997,9 @@ async function poll(){
 
 function ui(d){
   const dot=document.getElementById('connDot'),ct=document.getElementById('connText');
-  if(!d.config.varac_db_path){dot.className='conn-dot off';ct.textContent='Not configured — open Settings'}
-  else if(d.db_connected){dot.className='conn-dot';ct.textContent='Connected & watching'}
-  else{dot.className='conn-dot err';ct.textContent='Connection error'}
+  if(!d.config.varac_db_path){dot.className='conn-dot off';ct.textContent='VarAC not configured — open Settings'}
+  else if(d.db_connected){dot.className='conn-dot';ct.textContent='VarAC database connected'}
+  else{dot.className='conn-dot err';ct.textContent='VarAC database error'}
 
   const eb=document.getElementById('errBar');
   if(d.error&&d.config.varac_db_path){eb.textContent=d.error;eb.style.display='block'}else{eb.style.display='none'}
@@ -4911,25 +5009,46 @@ function ui(d){
   const aprsOn=d.config.aprs&&d.config.aprs.enabled;
   if(!aprsOn){ad.className='conn-dot off';at2.textContent='APRS off'}
   else if(!d.config.home_callsign){ad.className='conn-dot off';at2.textContent='APRS: set callsign in Settings'}
-  else if(d.aprs_connected){ad.className='conn-dot';at2.textContent='APRS connected'}
-  else{ad.className='conn-dot err';at2.textContent='APRS connecting...'}
+  else if(d.aprs_connected&&d.internet_up){ad.className='conn-dot';at2.textContent='APRS-IS connected (internet)'}
+  else if(d.aprs_connected&&!d.internet_up){ad.className='conn-dot err';at2.textContent='APRS-IS stale (no internet)'}
+  else if(!d.internet_up&&d.kiss_connected){ad.className='conn-dot';at2.textContent='APRS-IS offline (RF available)'}
+  else if(!d.internet_up){ad.className='conn-dot err';at2.textContent='APRS-IS offline (no internet)'}
+  else{ad.className='conn-dot err';at2.textContent='APRS-IS connecting...'}
   document.getElementById('aprsConn').style.display=aprsOn?'':'none';
 
   // KISS/Soundmodem RF status
   const kd=document.getElementById('kissDot'),kt=document.getElementById('kissText');
   const kissOn=d.config.soundmodem&&d.config.soundmodem.enabled;
-  if(!kissOn){kd.className='conn-dot off';kt.textContent='RF off'}
-  else if(d.kiss_connected){kd.className='conn-dot';kt.textContent='RF connected'}
-  else{kd.className='conn-dot err';kt.textContent='RF connecting...'}
+  if(!kissOn){kd.className='conn-dot off';kt.textContent='APRS RF off'}
+  else if(d.kiss_connected){kd.className='conn-dot';kt.textContent='APRS RF connected (Soundmodem)'}
+  else{kd.className='conn-dot err';kt.textContent='APRS RF connecting...'}
   document.getElementById('kissConn').style.display=kissOn?'':'none';
 
   // Pat/Winlink status
   const pd2=document.getElementById('patDot'),pt2=document.getElementById('patText');
   const patOn=d.config.pat&&d.config.pat.enabled;
   if(!patOn){pd2.className='conn-dot off';pt2.textContent='Winlink off'}
-  else if(d.pat_connected){pd2.className='conn-dot';pt2.textContent='Winlink connected'}
+  else if(d.pat_connected&&d.internet_up){pd2.className='conn-dot';pt2.textContent='Winlink connected (internet)'}
+  else if(d.pat_connected&&!d.internet_up&&d.config.pat.rf_fallback){pd2.className='conn-dot';pt2.textContent='Winlink connected (RF fallback)'}
+  else if(d.pat_connected&&!d.internet_up){pd2.className='conn-dot err';pt2.textContent='Winlink: no internet'}
   else{pd2.className='conn-dot off';pt2.textContent='Winlink: waiting for Pat'}
   document.getElementById('patConn').style.display=patOn?'':'none';
+
+  // RF Winlink countdown timer
+  var rfCd=document.getElementById('rfCountdown');
+  if(d.pat_using_rf&&d.pat_next_sync){
+    var remaining=Math.max(0,Math.round((new Date(d.pat_next_sync).getTime()-Date.now())/1000));
+    if(remaining>0){
+      var mins=Math.floor(remaining/60);
+      var secs=remaining%60;
+      var timeStr=mins>0?(mins+'m '+secs+'s'):(secs+'s');
+      document.getElementById('rfCountdownTime').textContent=timeStr;
+      rfCd.style.display='block';
+    }else{
+      document.getElementById('rfCountdownTime').textContent='syncing...';
+      rfCd.style.display='block';
+    }
+  }else{rfCd.style.display='none'}
 
   // New message buttons visibility
   const aprsAvail=aprsOn&&d.aprs_connected;
@@ -5020,6 +5139,22 @@ function ui(d){
     }
   }
 
+  // APRS delivery confirmation
+  if(d.aprs_last_ack){
+    var ackKey=d.aprs_last_ack.from+'_'+d.aprs_last_ack.msgno;
+    if(!window._ackInitialized){
+      // First time seeing any ACK data — initialize without toasting (may be stale)
+      window._ackInitialized=true;
+      window._lastAckKey=ackKey;
+    }else if(ackKey!==window._lastAckKey){
+      window._lastAckKey=ackKey;
+      toast('✓ Message delivered to '+d.aprs_last_ack.from+' (msg #'+d.aprs_last_ack.msgno+')');
+    }
+  }else{
+    // No ACK data yet — mark as initialized so the first real ACK triggers a toast
+    window._ackInitialized=true;
+  }
+
   window._d=d;render();
   if(currentTab==='map'&&_map)updateMapPosition();
 }
@@ -5094,6 +5229,25 @@ function card(a,isActive){
       <div class="msg-header"><div class="msg-from"><span class="msg-badge" style="background:#e2e8f0;color:#64748b">✓ Delivery Confirmation</span></div>
       <div class="msg-time">${a.friendly_time||''}</div></div>
       <div class="msg-body" style="color:var(--text3);font-size:13px">${esc(a.message)}</div></div>`;
+  }
+
+  // Sent messages — render as outgoing card with delivery status
+  if(a.type==='sent'){
+    var ch=(a.channel||'').toUpperCase();
+    var ts='';try{ts=new Date(a.time).toLocaleString()}catch(x){}
+    var statusLine='';
+    if(a.delivered){
+      statusLine+='<div style="font-size:11px;margin-top:6px;color:#16a34a;font-weight:600">✓ Delivered to '+esc(a.delivered_by||'')+'</div>';
+    }
+    if(a.mail_bot_confirmed){
+      statusLine+='<div style="font-size:11px;margin-top:2px;color:var(--text3)">📬 Stored in APRS mailbox</div>';
+    }
+    var borderColor=a.delivered?'#16a34a':'var(--orange)';
+    return `<div class="msg-card" style="border-left-color:${borderColor};background:var(--surface)">
+      <div class="msg-header"><div class="msg-from"><span class="msg-badge" style="background:var(--orange-light);color:var(--orange)">➡️ Sent</span> To: ${esc(a.to_callsign||'')}</div>
+      <div class="msg-time">${ts}</div></div>
+      ${ch?'<div style="font-size:11px;color:var(--text3);margin-bottom:4px">via '+esc(ch)+'</div>':''}
+      <div class="msg-body">${esc(a.message)}</div>${statusLine}</div>`;
   }
 
   let badges='';
