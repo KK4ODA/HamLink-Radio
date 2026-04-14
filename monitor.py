@@ -1732,23 +1732,28 @@ def _winlink_check_position():
         title = (item.findtext("title") or "").strip()
         desc = (item.findtext("description") or "").strip()
         pub_date = (item.findtext("pubDate") or "").strip()
-        # Parse lat/lon from description — typical format includes coordinates
-        # Try to extract from georss:point if present
+        # Parse lat/lon from the RSS item
         lat, lon = None, None
+        import re
+        # Method 1: georss:point tag (standard GeoRSS)
         georss = item.find("{http://www.georss.org/georss}point")
         if georss is not None and georss.text:
             parts = georss.text.strip().split()
             if len(parts) == 2:
                 lat, lon = float(parts[0]), float(parts[1])
-        # Fallback: parse from description text (e.g. "Latitude: 33.84, Longitude: -84.28")
+        # Method 2: title field (Winlink CMS format: "Position report for CALL is LAT / LON")
+        if lat is None and title:
+            m = re.search(r'(-?[\d.]+)\s*/\s*(-?[\d.]+)', title)
+            if m:
+                lat, lon = float(m.group(1)), float(m.group(2))
+        # Method 3: description field (e.g. "Latitude: 33.84, Longitude: -84.28")
         if lat is None and desc:
-            import re
             lat_m = re.search(r'[Ll]at(?:itude)?[:\s]+(-?[\d.]+)', desc)
             lon_m = re.search(r'[Ll]on(?:gitude)?[:\s]+(-?[\d.]+)', desc)
             if lat_m and lon_m:
                 lat, lon = float(lat_m.group(1)), float(lon_m.group(1))
         if lat is None or lon is None:
-            log.info("Winlink position: could not parse coordinates from %s", callsign)
+            log.info("Winlink position: could not parse coordinates from %s (title: %s)", callsign, title[:80])
             return
         # Parse timestamp
         pos_time = None
