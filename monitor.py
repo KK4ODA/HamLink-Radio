@@ -59,6 +59,9 @@ def _speaker_alarm_loop():
 
 def start_speaker_alarm():
     global _speaker_alarm_active, _speaker_alarm_thread
+    # Reset silenced flag — new alert means alarm should sound again
+    with slock:
+        state["alarm_silenced"] = False
     if _speaker_alarm_active:
         return
     _speaker_alarm_active = True
@@ -215,6 +218,7 @@ state = {
     "pat_connected": False, "pat_error": None, "pat_last_check": None,
     "aprs_last_position": None,
     "winlink_last_position": None,
+    "alarm_silenced": False,
 }
 slock = threading.Lock()
 
@@ -1966,19 +1970,17 @@ def send_pushover(title, message, reply_channel="varac"):
             for qr in quick_replies[:4]:  # Max 4 quick replies
                 qr_short = qr[:67] if reply_channel == "aprs" else qr
                 encoded = urllib.parse.quote(qr_short)
-                if reply_channel == "aprs":
-                    link = f"{base_url}/api/pushover_reply?channel=aprs&message={encoded}"
-                else:
-                    link = f"{base_url}/api/pushover_reply?channel=varac&message={encoded}"
+                link = f"{base_url}/api/pushover_reply?channel={reply_channel}&message={encoded}"
                 html_body += f'→ <a href="{link}">{qr_short}</a><br>'
 
         # Always include a dismiss link so the user can silence HamLink from their phone
         html_body += f'<br><a href="{base_url}/api/dismiss_from_phone">Dismiss Alert</a>'
+        html_body += '<br><small><i>Links require your phone to be on the same network as HamLink.</i></small>'
 
         p = {"token": po["api_token"], "user": po["user_key"],
              "title": title, "message": html_body, "html": "1",
              "priority": po.get("priority", 1), "sound": po.get("sound", "pushover"),
-             "url": f"{base_url}", "url_title": "Open Monitor"}
+             "url": f"{base_url}", "url_title": "Open Dashboard"}
         if p["priority"] == 2:
             p["retry"] = po.get("retry", 60)
             p["expire"] = po.get("expire", 3600)
@@ -2436,6 +2438,7 @@ def api_status():
             "pat_error": state["pat_error"],
             "aprs_last_position": state["aprs_last_position"],
             "winlink_last_position": state["winlink_last_position"],
+            "alarm_silenced": state["alarm_silenced"],
             "config": cfg_snap,
             "csrf_token": _csrf_token,
         })
@@ -2463,22 +2466,23 @@ def api_ack_all():
 
 @app.route("/api/dismiss_from_phone")
 def api_dismiss_from_phone():
-    """Dismiss all alerts from a phone link (Pushover notification)."""
-    with slock:
-        for a in state["pending_alerts"]:
-            state["acknowledged_ids"].add(a["id"])
-        state["pending_alerts"] = []
+    """Silence the alarm from a phone link. Alerts remain in pending so the
+    dashboard still shows them as new messages (user can reply from the PC)."""
     stop_speaker_alarm()
-    log.info("Alerts dismissed from phone")
+    with slock:
+        state["alarm_silenced"] = True
+    log.info("Alarm silenced from phone (alerts remain pending for reply)")
     return """<html><head><meta name="viewport" content="width=device-width,initial-scale=1">
     <style>body{font-family:system-ui;text-align:center;padding:40px 20px;background:#f0fdf4;color:#166534}
     h2{font-size:20px}p{color:#64748b;margin-top:8px}</style></head>
-    <body><h2>Alert Dismissed</h2><p>The alarm has been silenced and alerts cleared.</p></body></html>"""
+    <body><h2>Alarm Silenced</h2><p>The alarm has been stopped. Messages remain on the dashboard so you can reply from the PC.</p></body></html>"""
 
 @app.route("/api/stop_alarm", methods=["POST"])
 def api_stop_alarm():
     """Stop the PC speaker alarm without removing alerts from pending."""
     stop_speaker_alarm()
+    with slock:
+        state["alarm_silenced"] = True
     return jsonify({"ok": True})
 
 @app.route("/api/pushover_reply")
@@ -2494,12 +2498,20 @@ def api_pushover_reply():
 
     # Determine if this channel would use non-compliant RF
     nc_rf = False
+    nc_reason = ""
     if channel == "aprs":
         with slock:
             aprs_connected = state.get("aprs_connected", False)
             kiss_connected = state.get("kiss_connected", False)
         if kiss_connected and not aprs_connected:
-            nc_rf = True  # APRS would fall back to Soundmodem RF (exceeds 500 Hz)
+            nc_rf = True
+            nc_reason = "APRS via Soundmodem (RF) because internet is unavailable"
+    elif channel == "winlink":
+        with cfglock:
+            wl_rf = config.get("pat", {}).get("rf_fallback", False)
+        if wl_rf and not _check_internet(timeout=2):
+            nc_rf = True
+            nc_reason = "Winlink via VARA FM (RF) because internet is unavailable"
 
     if nc_rf:
         # Non-compliant RF — show blocking page with licensed/emergency override
@@ -2519,13 +2531,13 @@ def api_pushover_reply():
     <body>
       <div class="card">
         <h2>RF Bandwidth Compliance Warning</h2>
-        <p>This message will be transmitted via APRS Soundmodem (RF) because internet is unavailable.</p>
+        <p>This message will be transmitted via {nc_reason}.</p>
         <div class="msg">{safe_msg}</div>
         <div class="via">Channel: {safe_channel.upper()} (RF fallback)</div>
       </div>
       <div class="warn-block">
         <strong>FCC Part 97.221:</strong> Automatically controlled digital stations must not exceed
-        500 Hz occupied bandwidth. APRS via Soundmodem exceeds this limit and is
+        500 Hz occupied bandwidth. {safe_channel.upper()} via RF exceeds this limit and is
         <strong>blocked by default</strong>.
         <br><br>
         To proceed, you must confirm one of the following:
@@ -2539,15 +2551,24 @@ def api_pushover_reply():
       <button class="btn btn-cancel" onclick="window.close()">Cancel</button>
     </body></html>"""
 
-    is_varac = (channel == "varac")
-    heading = "Confirm Message" if is_varac else "Confirm Transmission"
-    description = ("Your message will be queued to the VarAC outbox. "
-                    "It will be transmitted when the remote operator next connects to your station."
-                    ) if is_varac else (
-                    "Your message will be sent via APRS-IS (internet). "
-                    "No RF transmission will occur from your station.")
-    via_label = f"Channel: {safe_channel.upper()} ({'queued to outbox' if is_varac else 'internet'})"
-    btn_label = "Queue Message" if is_varac else "Confirm &amp; Send"
+    if channel == "varac":
+        heading = "Confirm Message"
+        description = ("Your message will be queued to the VarAC outbox. "
+                        "It will be transmitted when the remote operator next connects to your station.")
+        via_label = f"Channel: VARAC (queued to outbox)"
+        btn_label = "Queue Message"
+    elif channel == "winlink":
+        heading = "Confirm Transmission"
+        description = ("Your message will be sent via Winlink (internet). "
+                        "No RF transmission will occur from your station.")
+        via_label = f"Channel: WINLINK (internet)"
+        btn_label = "Confirm &amp; Send"
+    else:
+        heading = "Confirm Transmission"
+        description = ("Your message will be sent via APRS-IS (internet). "
+                        "No RF transmission will occur from your station.")
+        via_label = f"Channel: APRS (internet)"
+        btn_label = "Confirm &amp; Send"
 
     return f"""<html><head><meta name="viewport" content="width=device-width,initial-scale=1">
     <style>
@@ -2597,6 +2618,23 @@ def api_pushover_reply_send():
             result = f"Sent via APRS to {to_call}" if ok else f"APRS failed: {err}"
         else:
             result = "Error: No traveler callsign configured"
+    elif channel == "winlink":
+        with cfglock:
+            traveler_tac = config.get("pat", {}).get("traveler_tactical", "")
+            watch = config.get("watch_callsigns", [])
+        to_addr = traveler_tac.upper() if traveler_tac else (
+            watch[0].upper().split("-")[0].split("/")[0] if watch else "")
+        if to_addr:
+            if "@" not in to_addr:
+                to_addr = to_addr + "@winlink.org"
+            ok, err = pat_send_message(to_addr, "Reply", msg)
+            if ok:
+                result = f"Sent via Winlink to {to_addr}"
+                threading.Thread(target=pat_connect_telnet, daemon=True).start()
+            else:
+                result = f"Winlink failed: {err}"
+        else:
+            result = "Error: No traveler address configured"
     else:
         # VarAC reply
         with cfglock:
@@ -3678,9 +3716,8 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
             <option value="magic">Magic</option><option value="persistent">Persistent</option>
             <option value="siren">Siren</option><option value="spacealarm">Space Alarm</option>
             <option value="none">Silent</option></select></div>
-        <div class="fg" style="display:flex;align-items:center;gap:8px">
-          <div class="toggle" id="cPoQuickReplies" onclick="this.classList.toggle('on')"></div>
-          <label class="fl" style="margin:0">Include Quick Replies in notifications</label></div>
+        <div class="fg"><div class="tgl-row"><label class="fl" style="margin:0">Include Quick Replies in notifications</label>
+          <div class="tgl" id="cPoQuickReplies" onclick="this.classList.toggle('on')"></div></div></div>
         <div class="fg"><button class="btn-a" onclick="testPo()">Send Test</button>
           <div class="tr" id="poTr"></div></div>
       </div>
@@ -4810,23 +4847,24 @@ function ui(d){
 }
 
 function dismiss(id){
+  // Soft dismiss: silence alarm for this alert but keep it in "New Messages" so user can reply
   dismissedIds.add(id);
-  cpost('/api/acknowledge',{id:id});
   const d=window._d;
   if(d){
-    d.pending=d.pending.filter(a=>a.id!==id);
     const remaining=d.pending.filter(a=>!dismissedIds.has(a.id));
     if(remaining.length===0){
       stopAlarm();
+      cpost('/api/stop_alarm');
     }
   }
   render();
 }
 function dismissAll(){
+  // Soft dismiss: silence all alarms but keep messages in "New Messages" so user can reply
   const d=window._d;if(!d)return;
   d.pending.forEach(a=>dismissedIds.add(a.id));
   stopAlarm();
-  cpost('/api/acknowledge_all');
+  cpost('/api/stop_alarm');
   render();
 }
 
@@ -4834,7 +4872,8 @@ function render(){
   const d=window._d;if(!d)return;
   // "alerting" = pending and not dismissed (alarm should sound)
   const alerting=d.pending.filter(a=>!dismissedIds.has(a.id));
-  if(alerting.length>0){const newest=alerting[alerting.length-1];startAlarm(newest.from_name||'')}else{stopAlarm()}
+  // Don't restart alarm if it was silenced (e.g., from phone dismiss)
+  if(alerting.length>0&&!d.alarm_silenced){const newest=alerting[alerting.length-1];startAlarm(newest.from_name||'')}else{stopAlarm()}
 
   // "active" = all pending messages — shown newest first
   const active=[...d.pending].reverse();
