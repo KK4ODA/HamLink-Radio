@@ -228,15 +228,29 @@ Winlink provides email-like messaging over radio. HamLink uses the Pat client to
 | **Enable** | Toggle on/off. |
 | **Pat Executable Path** | Full path to `pat.exe` (e.g., `C:\Pat\pat.exe`). |
 | **Pat HTTP Address** | Pat's web interface address. Default: `localhost:8080`. |
-| **Check Interval** | How often to sync with Winlink CMS, in seconds. Default: 30. |
+| **Check Interval** | How often to sync with Winlink CMS via internet (telnet), in seconds. Default: 30. |
 | **Home Tactical Address** | Optional tactical callsign for the home station (e.g., `BRECKEN`). |
 | **Traveler Tactical Address** | Optional tactical callsign for the traveler (e.g., `FACUNDO`). |
-| **RF Fallback** | If enabled and internet is down, uses VARA FM to connect to an RF gateway. |
+| **Query Winlink Position Reports** | If enabled, periodically checks the Winlink CMS for the traveler's latest position report and displays it on the dashboard. Uses the traveler's base callsign (not tactical address). |
+| **RF Fallback** | If enabled and internet is down, uses VARA FM to connect to an RF gateway for both sending and receiving Winlink messages. |
+| **RF Gateway Poll Interval** | How often to sync via RF gateway when internet is down, in seconds. Default: 10800 (3 hours). Minimum 600 (10 minutes). RF connections are slower and more resource-intensive than internet, so a longer interval is recommended. |
 | **RF Gateway** | Gateway station callsign (e.g., `WD5EMA-10`). |
 | **VARA FM Executable Path** | Path to `VARAFM.exe`. |
 | **VARA FM Modem Address** | VARA FM modem address. Default: `localhost:8300`. |
 
-### 5.9 APRS RF Monitor (Soundmodem)
+When internet is down, Pushover notifications and Winlink position report queries are automatically skipped (they require internet). The console log will show "Pushover skipped (no internet)" and "Winlink position check skipped (no internet)" instead of error messages.
+
+### 5.9 Offline Map
+
+Select a US state to enable offline map viewing on the Map tab. The app serves tiles from a local MBTiles file, so the map works without internet.
+
+| Field | Description |
+|-------|-------------|
+| **State** | Select your state. The app looks for a matching `.mbtiles` file (e.g., `georgia.mbtiles`) in the `tiles/` folder. |
+
+Download tiles using [MOBAC (Mobile Atlas Creator)](https://mobac.sourceforge.io/). Select OpenStreetMap as the source, your state area, zoom levels 6-13, and export as MBTiles. See `tiles/README.txt` for details.
+
+### 5.10 APRS RF Monitor (Soundmodem)
 
 Enables RF APRS via Soundmodem and the KISS protocol. Required for APRS RF fallback and RF beacons.
 
@@ -260,12 +274,15 @@ The main screen shows:
   - Gray: Waiting for messages
   - Red: New unread alert (pulsing border)
 - **Connection Indicators** — Shows which channels are active (VarAC, APRS-IS, KISS/RF, Winlink)
-- **Position Card** — If the traveler has been heard via APRS, shows their last known location with a "View on map" link
+- **Position Card** — If the traveler has been heard via APRS or Winlink position report, shows their last known location with a "View on Google Maps" link. The card pulses green with a "NEW" badge when the position changes; click "✓ Seen" to acknowledge
 - **Send Message Button** — Opens the compose box
 - **Post Sitrep to BBS Button** — Opens the sitrep form
 - **New Messages** — Pending alerts with "Got it" and "Reply" buttons
 - **Previous Messages** — Acknowledged message history
 - **Saved Message Log** — Toggleable CSV log of all messages
+- **Stop HamLink** — Button at the bottom to gracefully shut down the app and all associated programs
+
+The main interface has two tabs at the top: **Dashboard** (the main view) and **Offline Map** (interactive map showing the traveler's position using locally stored map tiles — works without internet).
 
 ### 6.2 Receiving Alerts
 

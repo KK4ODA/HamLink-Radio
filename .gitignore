@@ -13,6 +13,9 @@ dist/
 build/
 *.spec
 
+# Offline map tiles (large files, user-downloaded)
+tiles/*.mbtiles
+
 # Claude Code workspace
 .claude/
 *.zip

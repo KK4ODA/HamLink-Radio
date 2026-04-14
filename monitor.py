@@ -149,12 +149,14 @@ DEFAULT_CONFIG = {
     "pat": {"enabled": False, "exe_path": "", "http_addr": "localhost:8080",
             "auto_launch": True, "poll_interval": 30,
             "home_tactical": "", "traveler_tactical": "",
-            "rf_fallback": False, "rf_gateway": "", "varafm_addr": "localhost:8300",
+            "rf_fallback": False, "rf_gateway": "", "rf_poll_interval": 10800,
+            "varafm_addr": "localhost:8300",
             "varafm_exe_path": "", "position_reports": False},
     "beacon": {"enabled": False, "lat": 0.0, "lon": 0.0,
                "symbol_table": "/", "symbol_code": "-",
                "comment": "HamLink Radio", "interval_minutes": 30,
                "via_aprsis": True, "via_rf": False},
+    "map_state": "",
     "web_port": 5000,
     "alert_sound": "gentle",
     "alert_volume": 0.3,
@@ -350,6 +352,7 @@ def _process_aprs_packet(packet):
     try:
         ptype = packet.get("format", "")
         from_call = packet.get("from", "")
+        log.debug("APRS-IS packet: %s from %s (format: %s)", packet.get("raw", "")[:80], from_call, ptype)
 
         # Snapshot ALL config values we need in one lock acquisition
         # NEVER call _aprs_callsign() or _aprs_traveler_calls() while holding cfglock
@@ -382,14 +385,18 @@ def _process_aprs_packet(packet):
             if from_call.upper() == home_full:
                 pass  # Don't track our own position
             elif not watch_bases or base_from in watch_bases or base_from == home_base_only:
+                now_utc = datetime.now(timezone.utc).isoformat()
+                new_pos = {
+                    "callsign": from_call, "lat": lat, "lon": lon,
+                    "time": now_utc,
+                    "altitude": packet.get("altitude"),
+                    "speed": packet.get("speed"),
+                    "comment": packet.get("comment", ""),
+                }
                 with slock:
-                    state["aprs_last_position"] = {
-                        "callsign": from_call, "lat": lat, "lon": lon,
-                        "time": datetime.now(timezone.utc).isoformat(),
-                        "altitude": packet.get("altitude"),
-                        "speed": packet.get("speed"),
-                        "comment": packet.get("comment", ""),
-                    }
+                    old_pos = state["aprs_last_position"]
+                    state["aprs_last_position"] = new_pos
+                log.info("APRS position from %s: %.4f, %.4f", from_call, lat, lon)
 
         # --- Message packets ---
         if ptype == "message" or "message_text" in packet:
@@ -559,7 +566,8 @@ def _aprs_listener_loop():
                 cleaned = clean_call(c)
                 if cleaned:
                     watch_bases.add(cleaned)
-            filt = "b/" + "/".join(sorted(watch_bases))
+            # Wildcard (*) is required to match all SSIDs (e.g., KK4ODA* matches -7, -9, etc.)
+            filt = "b/" + "/".join(c + "*" for c in sorted(watch_bases))
 
             log.info("APRS-IS connecting as %s filter: %s", home, filt)
             ais = aprslib.IS(home, passwd=pc,
@@ -574,8 +582,17 @@ def _aprs_listener_loop():
                 state["aprs_error"] = None
             log.info("APRS-IS connected successfully")
             backoff = 15  # Reset backoff on successful connection
+
+            # Wrapper to log all incoming packets before processing
+            def _aprs_callback(packet):
+                from_c = packet.get("from", "?")
+                fmt = packet.get("format", "?")
+                raw = packet.get("raw", "")[:80]
+                log.info("APRS-IS RX: %s (format=%s) %s", from_c, fmt, raw)
+                _process_aprs_packet(packet)
+
             # immortal=False — we handle reconnection with backoff
-            ais.consumer(_process_aprs_packet, immortal=False, raw=False)
+            ais.consumer(_aprs_callback, immortal=False, raw=False)
         except ImportError:
             log.error("aprslib not installed")
             with slock:
@@ -1785,23 +1802,38 @@ def _pat_poll_loop():
     """
     global _pat_running
     INBOX_CHECK_INTERVAL = 15  # seconds between local inbox checks
+    _pat_cycle = 0
     while _pat_running:
+        _pat_cycle += 1
         try:
             with cfglock:
                 pt = config.get("pat", {})
                 enabled = pt.get("enabled", False)
-                sync_interval = max(pt.get("poll_interval", 60), 60)
+                inet_interval = max(pt.get("poll_interval", 60), 60)
+                rf_interval = max(pt.get("rf_poll_interval", 10800), 600)
+                rf_fallback = pt.get("rf_fallback", False)
+                rf_gateway = pt.get("rf_gateway", "")
             if not enabled:
                 with slock:
                     state["pat_connected"] = False
                     state["pat_error"] = None
                 time.sleep(5)
                 continue
+            log.info("Pat poll cycle #%d starting", _pat_cycle)
+            # Determine sync interval based on connectivity
+            has_internet = _check_internet(timeout=2)
+            use_rf = rf_fallback and rf_gateway and not has_internet
+            sync_interval = rf_interval if use_rf else inet_interval
             # Full sync with CMS
-            log.info("Pat: syncing with Winlink CMS (next sync in %ds)", sync_interval)
+            log.info("Pat: syncing with Winlink %s (next sync in %ds, internet=%s)",
+                     "via RF gateway" if use_rf else "via internet", sync_interval,
+                     "yes" if has_internet else "NO")
             pat_connect_telnet()
             _pat_check_inbox()
-            _winlink_check_position()
+            if has_internet:
+                _winlink_check_position()
+            else:
+                log.info("Winlink position check skipped (no internet)")
             # Between syncs, keep checking local inbox frequently
             elapsed = 0
             while elapsed < sync_interval and _pat_running:
@@ -1811,7 +1843,11 @@ def _pat_poll_loop():
                     still_enabled = config.get("pat", {}).get("enabled", False)
                 if not still_enabled:
                     break
-                _pat_check_inbox()
+                try:
+                    _pat_check_inbox()
+                except Exception as e:
+                    log.debug("Pat inbox check failed during wait: %s", e)
+            log.info("Pat: sync interval elapsed (%ds), starting next cycle", sync_interval)
         except Exception as e:
             log.error("Pat poll loop error (will retry): %s", e)
             time.sleep(15)  # Avoid tight error loop
@@ -1952,6 +1988,9 @@ def send_pushover(title, message, reply_channel="varac"):
         quick_replies = config.get("quick_replies", [])
         web_port = config.get("web_port", 5000)
     if not po.get("enabled") or not po.get("user_key") or not po.get("api_token"):
+        return
+    if not _check_internet(timeout=2):
+        log.info("Pushover skipped (no internet)")
         return
     try:
         import urllib.request, urllib.parse
@@ -2327,7 +2366,8 @@ signal.signal(signal.SIGTERM, _signal_handler)
 # ---------------------------------------------------------------------------
 # Flask
 # ---------------------------------------------------------------------------
-app = Flask(__name__)
+app = Flask(__name__, static_folder=os.path.join(os.path.dirname(os.path.abspath(__file__)), "static"),
+            static_url_path="/static")
 
 # Simple CSRF protection: generate a token per session, validate on POST
 _csrf_token = str(uuid.uuid4())
@@ -2352,6 +2392,50 @@ def _csrf_check():
 def index():
     return render_template_string(HTML_PAGE)
 
+# ---------------------------------------------------------------------------
+# MBTiles tile server
+# ---------------------------------------------------------------------------
+_mbtiles_conn = None
+_mbtiles_path = None
+
+@app.route("/tiles/<int:z>/<int:x>/<int:y>.png")
+def serve_tile(z, x, y):
+    """Serve map tiles from a local MBTiles file."""
+    global _mbtiles_conn, _mbtiles_path
+    from flask import Response
+    with cfglock:
+        state_name = config.get("map_state", "")
+    if not state_name:
+        return Response(b"", status=204)
+    fname = state_name.lower().replace(" ", "-") + ".mbtiles"
+    tiles_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tiles")
+    fpath = os.path.join(tiles_dir, fname)
+    # Cache connection, reopen if path changed
+    if _mbtiles_path != fpath or _mbtiles_conn is None:
+        if _mbtiles_conn:
+            try: _mbtiles_conn.close()
+            except: pass
+        if not os.path.isfile(fpath):
+            return Response(b"", status=204)
+        try:
+            _mbtiles_conn = sqlite3.connect(fpath, check_same_thread=False)
+            _mbtiles_path = fpath
+        except Exception:
+            return Response(b"", status=204)
+    # MBTiles uses TMS y-coordinate (flipped from XYZ)
+    tms_y = (2**z - 1) - y
+    try:
+        cur = _mbtiles_conn.cursor()
+        cur.execute("SELECT tile_data FROM tiles WHERE zoom_level=? AND tile_column=? AND tile_row=?",
+                    (z, x, tms_y))
+        row = cur.fetchone()
+        if row:
+            return Response(row[0], mimetype="image/png")
+    except Exception:
+        pass
+    # Transparent 1x1 PNG for missing tiles
+    return Response(b"", status=204)
+
 @app.route("/api/status")
 def api_status():
     # Snapshot config under cfglock FIRST (never nest slock -> cfglock)
@@ -2365,6 +2449,7 @@ def api_status():
             "watch_callsigns": list(config.get("watch_callsigns", [])),
             "operator_name": config.get("operator_name", ""),
             "home_callsign": config.get("home_callsign", ""),
+            "map_state": config.get("map_state", ""),
             "alert_sound": config.get("alert_sound", "gentle"),
             "alert_volume": config.get("alert_volume", 0.3),
             "quick_replies": list(config.get("quick_replies", [])),
@@ -2396,6 +2481,7 @@ def api_status():
                 "traveler_tactical": config.get("pat", {}).get("traveler_tactical", ""),
                 "position_reports": config.get("pat", {}).get("position_reports", False),
                 "rf_fallback": config.get("pat", {}).get("rf_fallback", False),
+                "rf_poll_interval": config.get("pat", {}).get("rf_poll_interval", 10800),
                 "rf_gateway": config.get("pat", {}).get("rf_gateway", ""),
                 "varafm_addr": config.get("pat", {}).get("varafm_addr", "localhost:8300"),
                 "varafm_exe_path": config.get("pat", {}).get("varafm_exe_path", ""),
@@ -2926,7 +3012,7 @@ def api_set_config():
                    "bbs_directory",
                    "poll_interval_seconds", "watch_callsigns",
                    "alert_sound", "alert_volume", "operator_name", "home_callsign",
-                   "quick_replies"]:
+                   "quick_replies", "map_state"]:
             if k in d:
                 config[k] = d[k]
         if "pushover" in d:
@@ -2942,7 +3028,7 @@ def api_set_config():
                 if sk in d["soundmodem"]:
                     config["soundmodem"][sk] = d["soundmodem"][sk]
         if "pat" in d:
-            for pk2 in ["enabled", "exe_path", "http_addr", "auto_launch", "poll_interval", "home_tactical", "traveler_tactical", "position_reports", "rf_fallback", "rf_gateway", "varafm_addr", "varafm_exe_path"]:
+            for pk2 in ["enabled", "exe_path", "http_addr", "auto_launch", "poll_interval", "home_tactical", "traveler_tactical", "position_reports", "rf_fallback", "rf_poll_interval", "rf_gateway", "varafm_addr", "varafm_exe_path"]:
                 if pk2 in d["pat"]:
                     config["pat"][pk2] = d["pat"][pk2]
         if "beacon" in d:
@@ -3279,6 +3365,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>HamLink Radio</title>
+<link rel="stylesheet" href="/static/leaflet.css">
+<script src="/static/leaflet.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
@@ -3327,6 +3415,8 @@ body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--t
 .status-card.alert{background:var(--red-bg);border:2px solid var(--red);
   animation:pulse-border 2s ease-in-out infinite}
 @keyframes pulse-border{0%,100%{box-shadow:0 0 0 0 rgba(220,38,38,0.2)}50%{box-shadow:0 0 0 12px rgba(220,38,38,0)}}
+@keyframes pulse-badge{0%,100%{opacity:1}50%{opacity:0.5}}
+@keyframes pulse-loc{0%,100%{background:var(--green-bg)}50%{background:#dcfce7}}
 
 /* CONNECTION DOT */
 .conn{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--text3);
@@ -3772,6 +3862,40 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
       </div>
 
       <div class="sett-section">
+        <h3>Offline Map</h3>
+        <div class="fg"><label class="fl">State</label>
+          <select class="fi" id="cMapState" style="width:220px">
+            <option value="">— None —</option>
+            <option value="Alabama">Alabama</option><option value="Alaska">Alaska</option>
+            <option value="Arizona">Arizona</option><option value="Arkansas">Arkansas</option>
+            <option value="California">California</option><option value="Colorado">Colorado</option>
+            <option value="Connecticut">Connecticut</option><option value="Delaware">Delaware</option>
+            <option value="Florida">Florida</option><option value="Georgia">Georgia</option>
+            <option value="Hawaii">Hawaii</option><option value="Idaho">Idaho</option>
+            <option value="Illinois">Illinois</option><option value="Indiana">Indiana</option>
+            <option value="Iowa">Iowa</option><option value="Kansas">Kansas</option>
+            <option value="Kentucky">Kentucky</option><option value="Louisiana">Louisiana</option>
+            <option value="Maine">Maine</option><option value="Maryland">Maryland</option>
+            <option value="Massachusetts">Massachusetts</option><option value="Michigan">Michigan</option>
+            <option value="Minnesota">Minnesota</option><option value="Mississippi">Mississippi</option>
+            <option value="Missouri">Missouri</option><option value="Montana">Montana</option>
+            <option value="Nebraska">Nebraska</option><option value="Nevada">Nevada</option>
+            <option value="New Hampshire">New Hampshire</option><option value="New Jersey">New Jersey</option>
+            <option value="New Mexico">New Mexico</option><option value="New York">New York</option>
+            <option value="North Carolina">North Carolina</option><option value="North Dakota">North Dakota</option>
+            <option value="Ohio">Ohio</option><option value="Oklahoma">Oklahoma</option>
+            <option value="Oregon">Oregon</option><option value="Pennsylvania">Pennsylvania</option>
+            <option value="Rhode Island">Rhode Island</option><option value="South Carolina">South Carolina</option>
+            <option value="South Dakota">South Dakota</option><option value="Tennessee">Tennessee</option>
+            <option value="Texas">Texas</option><option value="Utah">Utah</option>
+            <option value="Vermont">Vermont</option><option value="Virginia">Virginia</option>
+            <option value="Washington">Washington</option><option value="West Virginia">West Virginia</option>
+            <option value="Wisconsin">Wisconsin</option><option value="Wyoming">Wyoming</option>
+          </select>
+          <div class="fhint">Select your state. Place the matching .mbtiles file (e.g., georgia.mbtiles) in the tiles/ folder. Download tiles using <a href="https://mobac.sourceforge.io/" target="_blank">MOBAC (Mobile Atlas Creator)</a>.</div></div>
+      </div>
+
+      <div class="sett-section">
         <h3>APRS Position Beacon</h3>
         <div class="fg"><div class="tgl-row"><label class="fl" style="margin:0">Enable Position Beacon</label>
           <div class="tgl" id="cBcnOn" onclick="this.classList.toggle('on')"></div></div>
@@ -3856,6 +3980,9 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
         <div class="fg"><div class="tgl-row"><label class="fl" style="margin:0">Use VARA FM gateway if no internet</label>
           <div class="tgl" id="cPatRfFallback" onclick="this.classList.toggle('on')"></div></div>
           <div class="fhint">When internet is unavailable, Pat will connect to a nearby VARA FM gateway instead of telnet</div></div>
+        <div class="fg"><label class="fl">RF Gateway Poll Interval (seconds)</label>
+          <input class="fi" id="cPatRfPoll" type="number" min="600" max="43200" value="10800" style="width:140px">
+          <div class="fhint">How often to sync via RF gateway when internet is down. Default: 10800 (3 hours). Minimum 600 (10 minutes).</div></div>
         <div class="fg"><label class="fl">VARA FM Gateway</label>
           <div style="display:flex;gap:8px;align-items:center">
             <input class="fi" id="cPatRfGw" placeholder="e.g. W3ADO-10" style="width:160px">
@@ -3925,8 +4052,36 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
   <button class="btn-gear" onclick="openSett()">⚙</button>
 </div>
 
-<!-- MAIN -->
-<div class="main">
+<!-- TAB BAR -->
+<div style="max-width:640px;margin:0 auto;padding:8px 16px 0">
+  <div style="display:flex;gap:0;border-bottom:2px solid var(--border)">
+    <button id="tabDashboard" onclick="switchTab('dashboard')" style="flex:1;padding:10px;font-size:14px;font-weight:600;border:none;background:none;cursor:pointer;border-bottom:2px solid var(--accent);margin-bottom:-2px;color:var(--accent)">Dashboard</button>
+    <button id="tabMap" onclick="switchTab('map')" style="flex:1;padding:10px;font-size:14px;font-weight:600;border:none;background:none;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-2px;color:var(--text3)">Offline Map</button>
+  </div>
+</div>
+
+<!-- MAP TAB -->
+<div id="mapTab" style="display:none">
+  <div style="max-width:640px;margin:0 auto;padding:16px">
+    <div id="mapNoConfig" style="text-align:center;padding:40px 20px;color:var(--text3)">
+      <div style="font-size:40px;margin-bottom:12px">🗺️</div>
+      <p>No offline map configured.</p>
+      <p style="font-size:13px;margin-top:8px">Select a state in Settings and place the .mbtiles file in the tiles/ folder.</p>
+    </div>
+    <div id="mapContainer" style="display:none;height:500px;border-radius:12px;overflow:hidden;box-shadow:var(--shadow)"></div>
+    <div id="mapPosInfo" style="display:none;margin-top:12px;background:var(--surface);border-radius:var(--radius);padding:14px;box-shadow:var(--shadow)">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+        <span style="font-size:18px">📍</span>
+        <span style="font-size:14px;font-weight:700" id="mapPosTitle"></span>
+      </div>
+      <div style="font-size:12px;color:var(--text3)" id="mapPosTime"></div>
+      <div style="font-size:13px;color:var(--text2);margin-top:4px" id="mapPosDetails"></div>
+    </div>
+  </div>
+</div>
+
+<!-- MAIN (Dashboard tab) -->
+<div class="main" id="dashboardTab">
   <div class="error-bar" id="errBar"></div>
 
   <!-- STATUS -->
@@ -3941,16 +4096,20 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
   </div>
 
   <!-- LOCATION CARD -->
-  <div class="status-card waiting" id="locCard" style="display:none;text-align:left;padding:16px 20px">
+  <div class="status-card waiting" id="locCard" style="display:none;text-align:left;padding:16px 20px;transition:border-color .3s,box-shadow .3s">
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
       <span style="font-size:24px">📍</span>
-      <div>
-        <div style="font-size:14px;font-weight:700" id="locTitle">Last Known Position</div>
+      <div style="flex:1">
+        <div style="display:flex;align-items:center;gap:8px">
+          <div style="font-size:14px;font-weight:700" id="locTitle">Last Known Position</div>
+          <span id="locNewBadge" style="display:none;background:#16a34a;color:#fff;font-size:10px;font-weight:700;padding:2px 8px;border-radius:10px;animation:pulse-badge 1.5s ease-in-out infinite">NEW</span>
+        </div>
         <div style="font-size:12px;color:var(--text3)" id="locTime"></div>
       </div>
+      <button id="locAckBtn" onclick="ackPosition()" style="display:none;background:none;border:1px solid var(--border);border-radius:8px;padding:4px 10px;font-size:11px;color:var(--text3);cursor:pointer;white-space:nowrap">✓ Seen</button>
     </div>
     <div style="font-size:13px;color:var(--text2)" id="locDetails"></div>
-    <a id="locLink" href="#" target="_blank" style="display:inline-block;margin-top:8px;font-size:12px;font-weight:600;color:var(--accent);text-decoration:none">View on map →</a>
+    <a id="locLink" href="#" target="_blank" style="display:inline-block;margin-top:8px;font-size:12px;font-weight:600;color:var(--accent);text-decoration:none">View on Google Maps →</a>
   </div>
 
   <!-- NEW MESSAGE BUTTONS -->
@@ -4409,6 +4568,7 @@ async function fillForm(){
   document.getElementById('cAprsPort').value=ap.port||14580;
   document.getElementById('cAprsRfFallback').classList.toggle('on',!!ap.rf_fallback);
   document.getElementById('cAprsMailbox').classList.toggle('on',!!ap.use_mailbox);
+  document.getElementById('cMapState').value=c.map_state||'';
   const bcn=c.beacon||{};
   document.getElementById('cBcnOn').classList.toggle('on',!!bcn.enabled);
   document.getElementById('cBcnLat').value=bcn.lat||'';
@@ -4434,6 +4594,7 @@ async function fillForm(){
   document.getElementById('cPatHomeTac').value=pt.home_tactical||'';
   document.getElementById('cPatPosReports').classList.toggle('on',!!pt.position_reports);
   document.getElementById('cPatRfFallback').classList.toggle('on',!!pt.rf_fallback);
+  document.getElementById('cPatRfPoll').value=pt.rf_poll_interval||10800;
   document.getElementById('cPatRfGw').value=pt.rf_gateway||'';
   document.getElementById('cPatVaraAddr').value=pt.varafm_addr||'localhost:8300';
   document.getElementById('cPatVaraExe').value=pt.varafm_exe_path||'';
@@ -4462,6 +4623,7 @@ async function saveSett(){
     bbs_directory:document.getElementById('cBbsDir').value.trim(),
     varac_db_path:document.getElementById('cDb').value.trim(),
     poll_interval_seconds:parseInt(document.getElementById('cPoll').value)||15,
+    map_state:document.getElementById('cMapState').value,
     alert_sound:document.getElementById('cSound').value,
     alert_volume:parseInt(document.getElementById('cVol').value)/100,
     quick_replies:qr,
@@ -4511,6 +4673,7 @@ async function saveSett(){
       traveler_tactical:document.getElementById('cPatTravTac').value.trim().toUpperCase(),
       position_reports:document.getElementById('cPatPosReports').classList.contains('on'),
       rf_fallback:document.getElementById('cPatRfFallback').classList.contains('on'),
+      rf_poll_interval:parseInt(document.getElementById('cPatRfPoll').value)||10800,
       rf_gateway:document.getElementById('cPatRfGw').value.trim().toUpperCase(),
       varafm_addr:document.getElementById('cPatVaraAddr').value.trim()||'localhost:8300',
       varafm_exe_path:document.getElementById('cPatVaraExe').value.trim(),
@@ -4803,6 +4966,15 @@ function ui(d){
     if(pos.comment)det+=` · ${pos.comment}`;
     document.getElementById('locDetails').textContent=det;
     document.getElementById('locLink').href=`https://www.google.com/maps?q=${pos.lat},${pos.lon}`;
+    // Position change indicator (triggers on new coordinates OR new timestamp)
+    var curPosKey=pos.lat.toFixed(5)+','+pos.lon.toFixed(5)+','+(pos.time||'');
+    var isNew=_ackedPosKey!==null&&curPosKey!==_ackedPosKey;
+    var isFirst=_ackedPosKey===null;
+    if(isFirst){_ackedPosKey=curPosKey}// auto-ack the first position seen
+    document.getElementById('locNewBadge').style.display=isNew?'':'none';
+    document.getElementById('locAckBtn').style.display=isNew?'':'none';
+    if(isNew){lc.style.borderColor='#16a34a';lc.style.boxShadow='0 0 0 3px rgba(22,163,74,0.25)';lc.style.animation='pulse-loc 2s ease-in-out infinite'}
+    else{lc.style.borderColor='var(--border)';lc.style.boxShadow='var(--shadow)';lc.style.animation='none'}
   }else{lc.style.display='none'}
 
   // Status card
@@ -4849,6 +5021,7 @@ function ui(d){
   }
 
   window._d=d;render();
+  if(currentTab==='map'&&_map)updateMapPosition();
 }
 
 function dismiss(id){
@@ -4994,6 +5167,100 @@ async function loadLog(){
         +'<div class="msg-time">'+ts+'</div></div>'+subj+body+'</div>';
     }).join('');
   }catch(e){el.innerHTML='<div class="empty"><p>Failed to load log</p></div>'}
+}
+/* --- Position change tracking --- */
+var _ackedPosKey=null; // position key the user has acknowledged
+function ackPosition(){
+  var d=window._d;if(!d)return;
+  var pos=_getCurrentPos(d);
+  if(pos)_ackedPosKey=pos.lat.toFixed(5)+','+pos.lon.toFixed(5)+','+(pos.time||'');
+  document.getElementById('locNewBadge').style.display='none';
+  document.getElementById('locAckBtn').style.display='none';
+  document.getElementById('locCard').style.borderColor='var(--border)';
+  document.getElementById('locCard').style.boxShadow='var(--shadow)';
+  document.getElementById('locCard').style.animation='none';
+}
+function _getCurrentPos(d){
+  var pos=null;
+  if(d.aprs_last_position&&d.winlink_last_position){
+    var aT=new Date(d.aprs_last_position.time).getTime()||0;
+    var wT=new Date(d.winlink_last_position.time).getTime()||0;
+    pos=wT>aT?d.winlink_last_position:d.aprs_last_position;
+  }else if(d.aprs_last_position)pos=d.aprs_last_position;
+  else if(d.winlink_last_position)pos=d.winlink_last_position;
+  return pos;
+}
+
+/* --- Tab switching --- */
+var currentTab='dashboard';
+function switchTab(tab){
+  currentTab=tab;
+  document.getElementById('dashboardTab').style.display=tab==='dashboard'?'':'none';
+  document.getElementById('mapTab').style.display=tab==='map'?'':'none';
+  document.getElementById('tabDashboard').style.borderBottomColor=tab==='dashboard'?'var(--accent)':'transparent';
+  document.getElementById('tabDashboard').style.color=tab==='dashboard'?'var(--accent)':'var(--text3)';
+  document.getElementById('tabMap').style.borderBottomColor=tab==='map'?'var(--accent)':'transparent';
+  document.getElementById('tabMap').style.color=tab==='map'?'var(--accent)':'var(--text3)';
+  if(tab==='map')initMap();
+}
+
+/* --- Leaflet map --- */
+var _map=null,_marker=null,_tileLayer=null,_lastMapPos=null;
+function initMap(){
+  var d=window._d;
+  var mapState=d&&d.config?d.config.map_state:'';
+  if(!mapState){
+    document.getElementById('mapNoConfig').style.display='block';
+    document.getElementById('mapContainer').style.display='none';
+    return;
+  }
+  document.getElementById('mapNoConfig').style.display='none';
+  document.getElementById('mapContainer').style.display='block';
+  if(!_map){
+    // Fix Leaflet icon paths for static serving
+    L.Icon.Default.imagePath='/static/';
+    _map=L.map('mapContainer').setView([39.8,-98.5],5);
+    _tileLayer=L.tileLayer('/tiles/{z}/{x}/{y}.png',{
+      maxZoom:18,minZoom:3,
+      attribution:'Offline tiles'
+    }).addTo(_map);
+  }
+  setTimeout(function(){_map.invalidateSize()},100);
+  updateMapPosition();
+}
+function updateMapPosition(){
+  if(!_map)return;
+  var d=window._d;if(!d)return;
+  var pos=null,posSrc='';
+  if(d.aprs_last_position&&d.winlink_last_position){
+    var aT=new Date(d.aprs_last_position.time).getTime()||0;
+    var wT=new Date(d.winlink_last_position.time).getTime()||0;
+    if(wT>aT){pos=d.winlink_last_position;posSrc='Winlink'}
+    else{pos=d.aprs_last_position;posSrc='APRS'}
+  }else if(d.aprs_last_position){pos=d.aprs_last_position;posSrc='APRS'}
+  else if(d.winlink_last_position){pos=d.winlink_last_position;posSrc='Winlink'}
+  if(pos){
+    var ll=[pos.lat,pos.lon];
+    var posKey=pos.lat.toFixed(5)+','+pos.lon.toFixed(5);
+    if(_marker){_marker.setLatLng(ll)}
+    else{_marker=L.marker(ll).addTo(_map)}
+    var name=d.config.operator_name||pos.callsign||'Unknown';
+    var ts='';try{ts=new Date(pos.time).toLocaleString()}catch(x){}
+    _marker.bindPopup('<b>'+esc(name)+'</b><br>'+posSrc+' position<br>'+pos.lat.toFixed(4)+', '+pos.lon.toFixed(4)+'<br>'+ts);
+    // Only recenter map when position changes (don't fight user zoom/pan)
+    if(posKey!==_lastMapPos){_map.setView(ll,10);_lastMapPos=posKey}
+    // Update info panel below map
+    document.getElementById('mapPosInfo').style.display='block';
+    document.getElementById('mapPosTitle').textContent=name+' — '+posSrc+' Position';
+    document.getElementById('mapPosTime').textContent=ts;
+    var det=pos.lat.toFixed(4)+', '+pos.lon.toFixed(4);
+    if(pos.altitude)det+=' · '+Math.round(pos.altitude)+'m alt';
+    if(pos.speed)det+=' · '+Math.round(pos.speed)+' km/h';
+    if(pos.comment)det+=' · '+pos.comment;
+    document.getElementById('mapPosDetails').textContent=det;
+  }else{
+    document.getElementById('mapPosInfo').style.display='none';
+  }
 }
 </script>
 </body>
