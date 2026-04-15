@@ -274,7 +274,7 @@ The main screen shows:
   - Gray: Waiting for messages
   - Red: New unread alert (pulsing border)
 - **Connection Indicators** — Shows which channels are active (VarAC, APRS-IS, KISS/RF, Winlink)
-- **Position Card** — If the traveler has been heard via APRS or Winlink position report, shows their last known location with a "View on Google Maps" link. The card pulses green with a "NEW" badge when the position changes; click "✓ Seen" to acknowledge
+- **Position Card** — Shows the traveler's last known location from APRS beacons or Winlink position reports (whichever is most recent). The APRS position is saved to disk and persists across restarts. The card pulses green with a "NEW" badge when the position or timestamp changes; click "✓ Seen" to acknowledge. Includes a "View on Google Maps" link
 - **Send Message Button** — Opens the compose box
 - **Post Sitrep to BBS Button** — Opens the sitrep form
 - **New Messages** — Pending alerts with "Got it" and "Reply" buttons
@@ -325,9 +325,9 @@ Messages sent via internet-only channels (APRS-IS, Winlink telnet) and VarAC out
 
 **APRS length warning:** If your message exceeds 67 characters, a red warning appears. APRS messages are truncated at 67 characters.
 
-**Sent message tracking:** Sent messages appear in "Previous Messages" with an orange "Sent" badge. For APRS messages, the card updates with delivery status:
+**Sent message tracking:** Sent messages appear in "Previous Messages" showing "You → Recipient" with the channel used. For APRS messages, the card updates with delivery status:
 - **"✓ Delivered to CALLSIGN"** — The recipient's station acknowledged receipt (card border turns green)
-- **"📬 Stored in APRS mailbox"** — The APRS MAIL bot confirmed the message is stored for later retrieval
+- **"📬 Stored in APRS mailbox"** — The APRS MAIL bot confirmed the message is stored for later retrieval. The MAIL bot message is sent via internet (APRS-IS) when available, or via RF (Soundmodem through iGates) when internet is down.
 
 A toast notification also appears when a delivery acknowledgment is received.
 

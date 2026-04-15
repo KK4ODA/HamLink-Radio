@@ -4,6 +4,7 @@ config.json
 # Personal data
 message_log.csv
 .pat_seen_ids
+.last_position.json
 
 # Build artifacts
 HomeLink_Radio.zip

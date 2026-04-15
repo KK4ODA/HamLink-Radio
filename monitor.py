@@ -141,6 +141,29 @@ def log_reply(to_call, message, channel=""):
         })
 
 # ---------------------------------------------------------------------------
+# Persistent position storage
+# ---------------------------------------------------------------------------
+_POSITION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".last_position.json")
+
+def _save_position(pos):
+    """Save APRS position to disk so it survives restarts."""
+    try:
+        with open(_POSITION_FILE, "w", encoding="utf-8") as f:
+            json.dump(pos, f)
+    except Exception:
+        pass
+
+def _load_saved_position():
+    """Load last APRS position from disk."""
+    try:
+        if os.path.isfile(_POSITION_FILE):
+            with open(_POSITION_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return None
+
+# ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -235,7 +258,7 @@ state = {
     "pat_connected": False, "pat_error": None, "pat_last_check": None, "pat_next_sync": None, "pat_using_rf": False,
     "aprs_last_ack": None,
     "internet_up": True,
-    "aprs_last_position": None,
+    "aprs_last_position": _load_saved_position(),
     "winlink_last_position": None,
     "alarm_silenced": False,
 }
@@ -413,6 +436,7 @@ def _process_aprs_packet(packet):
                 with slock:
                     old_pos = state["aprs_last_position"]
                     state["aprs_last_position"] = new_pos
+                _save_position(new_pos)
                 log.info("APRS position from %s: %.4f, %.4f", from_call, lat, lon)
 
         # --- Message packets ---
@@ -2234,8 +2258,12 @@ def poll_once():
 
         for row in inbox_rows:
             fr = row["vmail_from"] or ""
-            # Skip messages FROM ourselves (outgoing copies VarAC may place in inbox)
-            if home_call_upper and fr.upper().startswith(home_call_upper.split("-")[0]):
+            # Skip messages FROM our exact home callsign (outgoing copies VarAC may place in inbox)
+            # But DO NOT skip portable/mobile variants (KK4ODA/P, KK4ODA/M) — those are the traveler
+            fr_upper = fr.upper().strip()
+            fr_base = fr_upper.split("/")[0].split("-")[0]  # Strip /P, /M, -SSID
+            is_own = (fr_upper == home_call_upper)  # Exact match only
+            if is_own:
                 log.debug("Skipping own outgoing vmail from %s to %s", fr, row["vmail_to"] or "")
                 continue
             if _match(fr):
@@ -4335,6 +4363,7 @@ initCompliance();
 let aprsManualUncheck=false;
 
 let _replyToCall='';
+let _composeChan='multi';  // Track which channel opened the compose box
 
 function openReply(chan,replyTo){
   _replyToCall=replyTo||'';
@@ -4350,6 +4379,7 @@ function openCompose(chan){
 }
 
 function _openComposeBox(chan){
+  _composeChan=chan;
   aprsManualUncheck=false;
   document.getElementById('replyText').value='';
   document.getElementById('replyStatus').textContent='';
@@ -4413,16 +4443,21 @@ function onComposeInput(){
   var t=document.getElementById('replyText').value;
   var warn=document.getElementById('aprsLengthWarn');
   var chk=document.getElementById('chkAprs');
-  if(t.length>67){
-    warn.style.display='block';
-    if(!aprsManualUncheck)chk.checked=false;
+  // Only auto-manage APRS checkbox if compose was opened with all channels or APRS specifically
+  if(_composeChan==='multi'||_composeChan==='aprs'){
+    if(t.length>67){
+      warn.style.display='block';
+      if(!aprsManualUncheck)chk.checked=false;
+    }else{
+      warn.style.display='none';
+      if(!aprsManualUncheck)chk.checked=true;
+      var d=window._d||{};
+      var aprsOn=d.config&&d.config.aprs&&d.config.aprs.enabled&&(d.aprs_connected||d.kiss_connected);
+      if(!aprsOn)chk.checked=false;
+    }
   }else{
-    warn.style.display='none';
-    if(!aprsManualUncheck)chk.checked=true;
-    // Re-show if APRS is available
-    var d=window._d||{};
-    var aprsOn=d.config&&d.config.aprs&&d.config.aprs.enabled&&(d.aprs_connected||d.kiss_connected);
-    if(!aprsOn)chk.checked=false;
+    // Single-channel reply (varac/winlink) — just show length warning, don't touch APRS checkbox
+    warn.style.display=t.length>67?'block':'none';
   }
 }
 
@@ -5243,19 +5278,24 @@ function card(a,isActive){
       statusLine+='<div style="font-size:11px;margin-top:2px;color:var(--text3)">📬 Stored in APRS mailbox</div>';
     }
     var borderColor=a.delivered?'#16a34a':'var(--orange)';
+    var msgClean=(a.message||'').replace(/^\[(APRS|Winlink|VarAC)\]\s*/i,'');
+    var toName=cfg.operator_name||a.to_callsign||'';
     return `<div class="msg-card" style="border-left-color:${borderColor};background:var(--surface)">
-      <div class="msg-header"><div class="msg-from"><span class="msg-badge" style="background:var(--orange-light);color:var(--orange)">➡️ Sent</span> To: ${esc(a.to_callsign||'')}</div>
+      <div class="msg-header"><div class="msg-from"><span class="msg-badge" style="background:var(--orange-light);color:var(--orange)">➡️ You → ${esc(toName)}</span></div>
       <div class="msg-time">${ts}</div></div>
       ${ch?'<div style="font-size:11px;color:var(--text3);margin-bottom:4px">via '+esc(ch)+'</div>':''}
-      <div class="msg-body">${esc(a.message)}</div>${statusLine}</div>`;
+      <div class="msg-body">${esc(msgClean)}</div>${statusLine}</div>`;
   }
 
   let badges='';
   if(isActive&&!dismissed)badges+='<span class="msg-badge badge-new">New</span>';
   if(a.urgent)badges+='<span class="msg-badge badge-urgent">Urgent</span>';
   if(a.type==='relay')badges+='<span class="msg-badge badge-relay">Relay Alert</span>';
-  if(a.type==='aprs')badges+='<span class="msg-badge" style="background:#dbeafe;color:#2563eb">APRS</span>';
-  if(a.type==='winlink')badges+='<span class="msg-badge" style="background:#fef3c7;color:#b45309">Winlink</span>';
+  // Channel badge as subtle tag
+  var chanTag='';
+  if(a.type==='aprs')chanTag='<span style="font-size:10px;color:#2563eb;font-weight:600;margin-left:6px">APRS</span>';
+  if(a.type==='winlink')chanTag='<span style="font-size:10px;color:#b45309;font-weight:600;margin-left:6px">Winlink</span>';
+  if(a.type==='vmail')chanTag='<span style="font-size:10px;color:#7c3aed;font-weight:600;margin-left:6px">VarAC</span>';
 
   const subj=a.subject?`<div class="msg-subject">${esc(a.subject)}</div>`:'';
   const body=(a.type==='vmail'||a.type==='aprs'||a.type==='winlink')&&a.message
@@ -5278,7 +5318,7 @@ function card(a,isActive){
   }
 
   return `<div class="${cls}">
-    <div class="msg-header"><div class="msg-from">${badges}${esc(name)}</div>
+    <div class="msg-header"><div class="msg-from">${badges}📨 ${esc(name)} → You${chanTag}</div>
     <div class="msg-time">${a.friendly_time||''}</div></div>
     ${subj}${body}${actions}</div>`;
 }
