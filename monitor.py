@@ -10,7 +10,7 @@ All configuration in the browser Settings panel.
 """
 
 import json, os, sys, sqlite3, time, threading, logging, uuid, csv, atexit, signal
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, render_template_string, request
 
 # ---------------------------------------------------------------------------
@@ -181,7 +181,7 @@ DEFAULT_CONFIG = {
                  "quick_replies": False},
     "aprs": {"enabled": False, "home_ssid": "-5", "traveler_ssids": "-7",
              "passcode": "", "server": "rotate.aprs2.net", "port": 14580,
-             "use_mailbox": False, "rf_fallback": False},
+             "use_mailbox": False, "rf_fallback": False, "aprs_fi_api_key": ""},
     "soundmodem": {"enabled": False, "exe_path": "", "kiss_host": "127.0.0.1",
                    "kiss_port": 8100, "auto_launch": True},
     "pat": {"enabled": False, "exe_path": "", "http_addr": "localhost:8080",
@@ -194,6 +194,11 @@ DEFAULT_CONFIG = {
                "symbol_table": "/", "symbol_code": "-",
                "comment": "HamLink Radio", "interval_minutes": 30,
                "via_aprsis": True, "via_rf": False},
+    "relay": {"enabled": False, "auto_retrieve": False,
+              "auto_retrieve_delay_seconds": 10, "confirm_before_connect": True,
+              "max_retries": 2, "retry_delay_seconds": 120,
+              "cooldown_seconds": 300, "route_replies_via_relay": True,
+              "ignore_stations": [], "min_snr": None},
     "map_state": "",
     "web_port": 5000,
     "alert_sound": "gentle",
@@ -217,6 +222,7 @@ def load_config():
             m["soundmodem"] = {**DEFAULT_CONFIG["soundmodem"], **s.get("soundmodem", {})}
             m["pat"] = {**DEFAULT_CONFIG["pat"], **s.get("pat", {})}
             m["beacon"] = {**DEFAULT_CONFIG["beacon"], **s.get("beacon", {})}
+            m["relay"] = {**DEFAULT_CONFIG["relay"], **s.get("relay", {})}
             # Ensure watch_callsigns is a list
             if isinstance(m.get("watch_callsigns"), str):
                 m["watch_callsigns"] = [c.strip() for c in m["watch_callsigns"].split(",") if c.strip()]
@@ -261,6 +267,13 @@ state = {
     "aprs_last_position": _load_saved_position(),
     "winlink_last_position": None,
     "alarm_silenced": False,
+    # Relay automation state
+    "relay_tracking": {},           # {relay_callsign: tracking entry dict}
+    "relay_retrieval_queue": [],    # Pending retrieval tasks
+    "relay_retrieval_active": False,# True while UI automation is running
+    "relay_last_attempt": {},       # {relay_callsign: ISO timestamp} for cooldown
+    "relay_pending_confirm": None,  # Relay callsign awaiting user confirmation (or None)
+    "relay_paths": {},              # {from_callsign: last_relay_station} for reply routing
 }
 slock = threading.Lock()
 
@@ -594,6 +607,93 @@ def aprs_send_message(to_call, message):
             log.info("APRS mailbox copy sent to MAIL for %s", mail_dest)
         return True, ""
     return False, "Failed to send"
+
+
+def _aprs_fi_backfill():
+    """Query aprs.fi for all traveler SSIDs at startup and update the saved
+    position if aprs.fi has something newer than what we persisted. Covers the
+    case where HamLink was off while the traveler moved — APRS-IS doesn't
+    replay history on reconnect, so we ask aprs.fi instead."""
+    import urllib.request, urllib.parse
+    with cfglock:
+        ap = config.get("aprs", {})
+        api_key = (ap.get("aprs_fi_api_key", "") or "").strip()
+    if not api_key:
+        return
+    if not _check_internet(timeout=3):
+        log.info("aprs.fi backfill: no internet, skipping")
+        return
+    traveler_calls = _aprs_traveler_calls()
+    if not traveler_calls:
+        return
+    names = ",".join(traveler_calls[:20])  # aprs.fi caps names per request
+    url = "https://api.aprs.fi/api/get?" + urllib.parse.urlencode({
+        "name": names, "what": "loc", "apikey": api_key, "format": "json",
+    })
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "HamLink-Radio"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        log.warning("aprs.fi backfill failed: %s", e)
+        return
+    if data.get("result") != "ok":
+        log.warning("aprs.fi backfill: %s", data.get("description", data.get("result")))
+        return
+    entries = data.get("entries", []) or []
+    if not entries:
+        log.info("aprs.fi backfill: no entries for %s", names)
+        return
+
+    def _etime(e):
+        try:
+            return int(e.get("lasttime") or e.get("time") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    newest = max(entries, key=_etime)
+    newest_ts = _etime(newest)
+    if newest_ts <= 0:
+        return
+
+    with slock:
+        saved = state.get("aprs_last_position")
+    saved_ts = 0
+    if saved and saved.get("time"):
+        try:
+            saved_ts = int(datetime.fromisoformat(
+                saved["time"].replace("Z", "+00:00")).timestamp())
+        except Exception:
+            saved_ts = 0
+    if newest_ts <= saved_ts:
+        log.info("aprs.fi backfill: saved position is current")
+        return
+    try:
+        lat = float(newest.get("lat"))
+        lon = float(newest.get("lng"))
+    except (TypeError, ValueError):
+        return
+
+    def _fnum(v):
+        try:
+            return float(v) if v not in (None, "") else None
+        except (TypeError, ValueError):
+            return None
+
+    iso = datetime.fromtimestamp(newest_ts, tz=timezone.utc).isoformat()
+    new_pos = {
+        "callsign": newest.get("name", ""),
+        "lat": lat, "lon": lon, "time": iso,
+        "altitude": _fnum(newest.get("altitude")),
+        "speed": _fnum(newest.get("speed")),
+        "comment": newest.get("comment", "") or "",
+        "source": "aprs.fi",
+    }
+    with slock:
+        state["aprs_last_position"] = new_pos
+    _save_position(new_pos)
+    log.info("aprs.fi backfill: updated position from %s at %s (%.4f, %.4f)",
+             new_pos["callsign"], iso, lat, lon)
 
 
 def _aprs_listener_loop():
@@ -1175,6 +1275,202 @@ def varac_send_broadcast(message, to="ALL"):
 
     win32gui.SendMessage(send_btn, BM_CLICK, 0, 0)
     log.info("VarAC broadcast sent: TO=%s MSG=%s", to, message[:60])
+    return True, ""
+
+
+def varac_retrieve_relay(relay_callsign):
+    """Retrieve VMail from a relay station by automating VarAC's relay notification dialog.
+    Uses UI Automation to click the RELAY status bar label, then finds and double-clicks
+    the callsign in the DataGridView. Returns (ok, error_string)."""
+    if sys.platform != "win32":
+        return False, "VarAC relay automation only supported on Windows"
+    try:
+        import win32gui, win32con
+    except ImportError:
+        return False, "pywin32 not installed (pip install pywin32)"
+    try:
+        import comtypes, comtypes.client
+        comtypes.client.GetModule("UIAutomationCore.dll")
+        from comtypes.gen.UIAutomationClient import CUIAutomation, IUIAutomation
+    except Exception as e:
+        return False, f"UI Automation not available: {e}"
+
+    import ctypes
+    user32 = ctypes.windll.user32
+    BM_CLICK = 0x00F5
+
+    def _find_window_by_title(pattern):
+        import re
+        result = []
+        def callback(h, _):
+            if win32gui.IsWindowVisible(h):
+                title = win32gui.GetWindowText(h)
+                if re.search(pattern, title, re.IGNORECASE):
+                    result.append(h)
+            return True
+        win32gui.EnumWindows(callback, None)
+        return result[0] if result else None
+
+    def _get_children(hwnd):
+        children = []
+        def callback(h, _):
+            children.append(h)
+            return True
+        try:
+            win32gui.EnumChildWindows(hwnd, callback, None)
+        except Exception:
+            pass
+        return children
+
+    def _find_child_by_text(parent, text):
+        for h in _get_children(parent):
+            try:
+                if win32gui.GetWindowText(h).strip() == text.strip() and win32gui.IsWindowVisible(h):
+                    return h
+            except Exception:
+                pass
+        return None
+
+    relay_call_upper = relay_callsign.upper().strip()
+    log.info("Relay retrieve: starting for callsign %s", relay_callsign)
+
+    # Step 1: Find VarAC main window
+    varac_hwnd = _find_window_by_title(r"VarAC.*V\d+")
+    if not varac_hwnd:
+        return False, "VarAC window not found"
+    log.info("Relay retrieve: found VarAC main window hwnd=%d", varac_hwnd)
+
+    # Step 2: Click the RELAY label in VarAC's status bar using UI Automation
+    # The RELAY label is a .NET ToolStripStatusLabel, not a Win32 button
+    try:
+        uia = comtypes.CoCreateInstance(
+            CUIAutomation._reg_clsid_, interface=IUIAutomation,
+            clsctx=comtypes.CLSCTX_INPROC_SERVER)
+        root = uia.ElementFromHandle(varac_hwnd)
+        true_cond = uia.CreateTrueCondition()
+        elements = root.FindAll(4, true_cond)  # TreeScope_Descendants
+        relay_label = None
+        for i in range(elements.Length):
+            el = elements.GetElement(i)
+            name = (el.CurrentName or "").strip()
+            if name == "RELAY":
+                rect = el.CurrentBoundingRectangle
+                if rect.right > rect.left:  # Has valid bounds
+                    relay_label = rect
+                    break
+    except Exception as e:
+        return False, f"UI Automation error finding RELAY label: {e}"
+
+    if not relay_label:
+        return False, "RELAY label not found in VarAC status bar"
+
+    # Bring VarAC to foreground and click the RELAY label
+    user32.SetForegroundWindow(varac_hwnd)
+    time.sleep(0.3)
+    cx = (relay_label.left + relay_label.right) // 2
+    cy = (relay_label.top + relay_label.bottom) // 2
+    user32.SetCursorPos(cx, cy)
+    time.sleep(0.15)
+    user32.mouse_event(2, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTDOWN
+    user32.mouse_event(4, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
+    log.info("Relay retrieve: clicked RELAY status bar label at (%d,%d)", cx, cy)
+    time.sleep(1.2)
+
+    # Step 3: Find the relay notification dialog
+    dialog_hwnd = _find_window_by_title("VMail Relay notification")
+    if not dialog_hwnd:
+        dialog_hwnd = _find_window_by_title("VMail Relay")
+    if not dialog_hwnd:
+        return False, "Relay notification dialog did not open"
+    log.info("Relay retrieve: dialog opened hwnd=%d", dialog_hwnd)
+
+    # Step 4: Find the callsign in the DataGridView using UI Automation
+    # The grid has rows with "Callsign Row N" cells containing the callsign text
+    try:
+        dialog_el = uia.ElementFromHandle(dialog_hwnd)
+        d_elements = dialog_el.FindAll(4, true_cond)
+        target_rect = None
+        for i in range(d_elements.Length):
+            el = d_elements.GetElement(i)
+            name = (el.CurrentName or "")
+            # Match "Callsign Row N" cells — the Value property contains the actual callsign
+            if name.startswith("Callsign Row"):
+                try:
+                    # Get the Value pattern to read cell content
+                    from comtypes.gen.UIAutomationClient import IUIAutomationValuePattern
+                    val_pattern = el.GetCurrentPattern(10002)  # UIA_ValuePatternId
+                    if val_pattern:
+                        vp = val_pattern.QueryInterface(IUIAutomationValuePattern)
+                        cell_value = (vp.CurrentValue or "").upper().strip()
+                        if relay_call_upper in cell_value:
+                            target_rect = el.CurrentBoundingRectangle
+                            log.info("Relay retrieve: found callsign '%s' in %s via Value pattern",
+                                     cell_value, name)
+                            break
+                except Exception:
+                    pass
+                # Fallback: try reading the cell's Name property for the callsign
+                # Some DataGridView implementations include the value in accessible name
+                rect = el.CurrentBoundingRectangle
+                if rect.right > rect.left:
+                    # We'll try double-clicking each Callsign cell row by row as last resort
+                    pass
+
+        # If Value pattern didn't work, try clicking on the Callsign column cells
+        # and reading text, or just iterate all row elements looking for the callsign text
+        if not target_rect:
+            for i in range(d_elements.Length):
+                el = d_elements.GetElement(i)
+                name = (el.CurrentName or "").upper()
+                if relay_call_upper in name:
+                    rect = el.CurrentBoundingRectangle
+                    if rect.right > rect.left:
+                        target_rect = rect
+                        log.info("Relay retrieve: found callsign in element name '%s'",
+                                 el.CurrentName)
+                        break
+
+    except Exception as e:
+        # Close dialog and report
+        close_btn = _find_child_by_text(dialog_hwnd, "CLOSE")
+        if close_btn:
+            win32gui.SendMessage(close_btn, BM_CLICK, 0, 0)
+        return False, f"UI Automation error searching dialog: {e}"
+
+    if not target_rect:
+        close_btn = _find_child_by_text(dialog_hwnd, "CLOSE")
+        if close_btn:
+            win32gui.SendMessage(close_btn, BM_CLICK, 0, 0)
+        return False, f"Callsign {relay_callsign} not found in relay notification dialog"
+
+    # Step 5: Double-click the callsign cell to trigger VarAC's connect+retrieve
+    user32.SetForegroundWindow(dialog_hwnd)
+    time.sleep(0.2)
+    cx = (target_rect.left + target_rect.right) // 2
+    cy = (target_rect.top + target_rect.bottom) // 2
+    user32.SetCursorPos(cx, cy)
+    time.sleep(0.15)
+    # Double-click using mouse events
+    user32.mouse_event(2, 0, 0, 0, 0)  # LEFTDOWN
+    user32.mouse_event(4, 0, 0, 0, 0)  # LEFTUP
+    time.sleep(0.05)
+    user32.mouse_event(2, 0, 0, 0, 0)  # LEFTDOWN
+    user32.mouse_event(4, 0, 0, 0, 0)  # LEFTUP
+    log.info("Relay retrieve: double-clicked callsign %s at (%d,%d)", relay_callsign, cx, cy)
+
+    # Step 6: Wait for VarAC to process (QSY + connect)
+    time.sleep(2.0)
+
+    # Check if dialog closed (VarAC may close it after starting connection)
+    if not win32gui.IsWindow(dialog_hwnd) or not win32gui.IsWindowVisible(dialog_hwnd):
+        log.info("Relay retrieve: dialog closed — VarAC is connecting to relay")
+    else:
+        log.info("Relay retrieve: dialog still open — VarAC may be processing")
+        close_btn = _find_child_by_text(dialog_hwnd, "CLOSE")
+        if close_btn:
+            win32gui.SendMessage(close_btn, BM_CLICK, 0, 0)
+            log.info("Relay retrieve: closed relay dialog")
+
     return True, ""
 
 
@@ -1970,6 +2266,7 @@ def start_aprs():
     _aprs_thread = threading.Thread(target=_aprs_listener_loop, daemon=True)
     _aprs_thread.start()
     log.info("APRS listener thread started")
+    threading.Thread(target=_aprs_fi_backfill, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -2080,9 +2377,156 @@ def start_beacon():
 
 
 # ---------------------------------------------------------------------------
+# Relay retrieval automation
+# ---------------------------------------------------------------------------
+_relay_thread = None
+_relay_running = False
+
+def _relay_retrieval_loop():
+    """Background thread: process the relay retrieval queue, connecting to relay
+    stations via VarAC UI automation to download pending VMails."""
+    global _relay_running
+    log.info("Relay retrieval loop started")
+    while _relay_running:
+        try:
+            with cfglock:
+                rcfg = config.get("relay", {})
+            if not rcfg.get("enabled"):
+                for _ in range(50):  # 5s sleep in 0.1s increments
+                    if not _relay_running:
+                        return
+                    time.sleep(0.1)
+                continue
+
+            delay_secs = rcfg.get("auto_retrieve_delay_seconds", 10)
+            max_retries = rcfg.get("max_retries", 2)
+            retry_delay = rcfg.get("retry_delay_seconds", 120)
+            cooldown = rcfg.get("cooldown_seconds", 300)
+
+            # Check for pending items in the queue
+            with slock:
+                queue = list(state["relay_retrieval_queue"])
+            if not queue:
+                for _ in range(50):
+                    if not _relay_running:
+                        return
+                    time.sleep(0.1)
+                continue
+
+            task = queue[0]
+            relay_call = task["relay_station"]
+            relay_upper = relay_call.upper().strip()
+
+            # Respect the delay before first attempt
+            queued_at = task.get("queued_at", "")
+            if queued_at:
+                try:
+                    q_dt = datetime.fromisoformat(queued_at.replace("Z", "+00:00"))
+                    elapsed = (datetime.now(timezone.utc) - q_dt).total_seconds()
+                    if elapsed < delay_secs:
+                        wait = delay_secs - elapsed
+                        log.debug("Relay retrieve: waiting %.0fs before connecting to %s", wait, relay_call)
+                        for _ in range(int(wait * 10)):
+                            if not _relay_running:
+                                return
+                            time.sleep(0.1)
+                        continue
+                except Exception:
+                    pass
+
+            # Check cooldown
+            with slock:
+                last_attempt_iso = state["relay_last_attempt"].get(relay_upper)
+            if last_attempt_iso:
+                try:
+                    la_dt = datetime.fromisoformat(last_attempt_iso.replace("Z", "+00:00"))
+                    elapsed = (datetime.now(timezone.utc) - la_dt).total_seconds()
+                    if elapsed < cooldown:
+                        log.info("Relay %s still in cooldown (%ds remaining), skipping",
+                                 relay_call, int(cooldown - elapsed))
+                        with slock:
+                            if state["relay_retrieval_queue"] and state["relay_retrieval_queue"][0] is task:
+                                state["relay_retrieval_queue"].pop(0)
+                        continue
+                except Exception:
+                    pass
+
+            # Attempt retrieval
+            with slock:
+                state["relay_retrieval_active"] = True
+                if relay_upper in state["relay_tracking"]:
+                    state["relay_tracking"][relay_upper]["status"] = "retrieving"
+
+            log.info("Relay retrieve: connecting to %s", relay_call)
+            now_iso = datetime.now(timezone.utc).isoformat()
+            with slock:
+                state["relay_last_attempt"][relay_upper] = now_iso
+
+            ok, err = varac_retrieve_relay(relay_call)
+
+            with slock:
+                state["relay_retrieval_active"] = False
+                entry = state["relay_tracking"].get(relay_upper, {})
+
+                if ok:
+                    entry["status"] = "retrieved"
+                    entry["last_attempt"] = now_iso
+                    entry["error"] = None
+                    log.info("Relay retrieve: success for %s", relay_call)
+                else:
+                    entry["attempts"] = entry.get("attempts", 0) + 1
+                    entry["last_attempt"] = now_iso
+                    entry["error"] = err
+                    if entry["attempts"] >= max_retries:
+                        entry["status"] = "failed"
+                        log.warning("Relay retrieve: FAILED for %s after %d attempts: %s",
+                                    relay_call, entry["attempts"], err)
+                    else:
+                        entry["status"] = "queued"
+                        log.warning("Relay retrieve: attempt %d failed for %s: %s — will retry in %ds",
+                                    entry["attempts"], relay_call, err, retry_delay)
+
+                # Remove from queue
+                if state["relay_retrieval_queue"] and state["relay_retrieval_queue"][0] is task:
+                    state["relay_retrieval_queue"].pop(0)
+
+                # Re-queue for retry if needed
+                if not ok and entry.get("status") == "queued":
+                    retry_at = datetime.now(timezone.utc) + timedelta(seconds=retry_delay)
+                    state["relay_retrieval_queue"].append({
+                        "relay_station": relay_call,
+                        "frequency_mhz": task.get("frequency_mhz", ""),
+                        "queued_at": retry_at.isoformat(),
+                    })
+
+        except Exception as e:
+            log.error("Relay retrieval loop error: %s", e)
+            with slock:
+                state["relay_retrieval_active"] = False
+
+        # Sleep 5 seconds between checks
+        for _ in range(50):
+            if not _relay_running:
+                return
+            time.sleep(0.1)
+
+    log.info("Relay retrieval loop stopped")
+
+
+def start_relay():
+    global _relay_thread, _relay_running
+    if _relay_thread and _relay_thread.is_alive():
+        return
+    _relay_running = True
+    _relay_thread = threading.Thread(target=_relay_retrieval_loop, daemon=True)
+    _relay_thread.start()
+    log.info("Relay retrieval thread started")
+
+
+# ---------------------------------------------------------------------------
 # Pushover
 # ---------------------------------------------------------------------------
-def send_pushover(title, message, reply_channel="varac"):
+def send_pushover(title, message, reply_channel="varac", relay_station="", relay_status=""):
     with cfglock:
         po = config.get("pushover", {})
         quick_replies = config.get("quick_replies", [])
@@ -2107,6 +2551,12 @@ def send_pushover(title, message, reply_channel="varac"):
             local_ip = "127.0.0.1"
         base_url = f"http://{local_ip}:{web_port}"
         html_body = message.replace("\n", "<br>")
+
+        # Relay approval link for confirmed_wait status
+        if relay_station and relay_status == "confirmed_wait":
+            encoded_station = urllib.parse.quote(relay_station)
+            approve_link = f"{base_url}/api/relay/approve_from_phone?station={encoded_station}"
+            html_body += f'<br><br>→ <a href="{approve_link}"><b>Approve Auto-Retrieval</b></a>'
 
         po_quick = po.get("quick_replies", False)
         if po_quick and quick_replies:
@@ -2208,6 +2658,92 @@ def init_hwm():
         log.warning("HWM init failed: %s", e)
         return False
 
+def _process_relay_notification(fr, freq_mhz, urgent, t, opname):
+    """Process a relay notification with relay-specific logic (tracking, queueing, cooldown).
+    Returns a dict to add to the relay_tracking entry (or None to skip)."""
+    with cfglock:
+        rcfg = config.get("relay", {})
+    enabled = rcfg.get("enabled", False)
+    auto_retrieve = rcfg.get("auto_retrieve", False) and enabled
+    confirm = rcfg.get("confirm_before_connect", True)
+    cooldown = rcfg.get("cooldown_seconds", 300)
+    ignore_list = [s.upper().strip() for s in rcfg.get("ignore_stations", [])]
+
+    fr_upper = fr.upper().strip()
+    now_utc = datetime.now(timezone.utc).isoformat()
+
+    # Check ignore list
+    if fr_upper in ignore_list:
+        log.info("Relay from %s ignored (in ignore_stations list)", fr)
+        return None
+
+    with slock:
+        tracking = state["relay_tracking"]
+        last_attempts = state["relay_last_attempt"]
+
+        # Check cooldown
+        last_attempt_time = last_attempts.get(fr_upper)
+        if last_attempt_time:
+            try:
+                la_dt = datetime.fromisoformat(last_attempt_time.replace("Z", "+00:00"))
+                elapsed = (datetime.now(timezone.utc) - la_dt).total_seconds()
+                if elapsed < cooldown:
+                    log.info("Relay from %s skipped (cooldown: %ds remaining)", fr, int(cooldown - elapsed))
+                    # Still update tracking entry if it exists
+                    if fr_upper in tracking:
+                        tracking[fr_upper]["last_seen"] = now_utc
+                        tracking[fr_upper]["notification_count"] = tracking[fr_upper].get("notification_count", 0) + 1
+                    return None
+            except Exception:
+                pass
+
+        # Upsert relay tracking entry
+        if fr_upper in tracking:
+            entry = tracking[fr_upper]
+            entry["last_seen"] = now_utc
+            entry["notification_count"] = entry.get("notification_count", 0) + 1
+            entry["frequency_mhz"] = freq_mhz
+            entry["urgent"] = urgent
+            # Don't overwrite status if already queued/retrieving
+            if entry.get("status") in ("retrieved", "failed"):
+                entry["status"] = "pending"  # Re-arm on new notification
+                entry["attempts"] = 0
+                entry["error"] = None
+        else:
+            entry = {
+                "relay_station": fr,
+                "frequency_mhz": freq_mhz,
+                "first_seen": now_utc,
+                "last_seen": now_utc,
+                "notification_count": 1,
+                "urgent": urgent,
+                "status": "pending",
+                "last_attempt": None,
+                "attempts": 0,
+                "error": None,
+                "retrieved_vmail_ids": [],
+            }
+            tracking[fr_upper] = entry
+
+        # Queue for retrieval if auto_retrieve is enabled
+        if auto_retrieve and entry["status"] == "pending":
+            if confirm:
+                entry["status"] = "confirmed_wait"
+                state["relay_pending_confirm"] = fr_upper
+                log.info("Relay from %s awaiting user confirmation", fr)
+            else:
+                entry["status"] = "queued"
+                if fr_upper not in [q.get("relay_station", "").upper() for q in state["relay_retrieval_queue"]]:
+                    state["relay_retrieval_queue"].append({
+                        "relay_station": fr,
+                        "frequency_mhz": freq_mhz,
+                        "queued_at": now_utc,
+                    })
+                log.info("Relay from %s queued for auto-retrieval", fr)
+
+    return entry
+
+
 def poll_once():
     with cfglock:
         dbp = config.get("varac_db_path", "")
@@ -2258,13 +2794,17 @@ def poll_once():
 
         for row in inbox_rows:
             fr = row["vmail_from"] or ""
-            # Skip messages FROM our exact home callsign (outgoing copies VarAC may place in inbox)
-            # But DO NOT skip portable/mobile variants (KK4ODA/P, KK4ODA/M) — those are the traveler
+            to = row["vmail_to"] or ""
+            # Skip messages FROM our exact home callsign ONLY if they're addressed
+            # to someone else (leaked outgoing copies VarAC may place in inbox).
+            # If vmail_to == home_callsign, always alert — someone sent us a message
+            # (even if vmail_from also matches, e.g. portable station using base call).
             fr_upper = fr.upper().strip()
+            to_upper = to.upper().strip()
             fr_base = fr_upper.split("/")[0].split("-")[0]  # Strip /P, /M, -SSID
-            is_own = (fr_upper == home_call_upper)  # Exact match only
+            is_own = (fr_upper == home_call_upper) and (to_upper != home_call_upper)
             if is_own:
-                log.debug("Skipping own outgoing vmail from %s to %s", fr, row["vmail_to"] or "")
+                log.debug("Skipping own outgoing vmail from %s to %s", fr, to)
                 continue
             if _match(fr):
                 t = row["received_time"] or row["creation_time"] or datetime.now(timezone.utc).isoformat()
@@ -2283,6 +2823,15 @@ def poll_once():
                     "friendly_time": _friendly_time(t),
                 })
 
+        # Track relay paths from incoming VMails (for reply routing)
+        for row in inbox_rows:
+            via = row["vmail_via"] or ""
+            fr = row["vmail_from"] or ""
+            if via.strip() and fr.strip():
+                with slock:
+                    state["relay_paths"][fr.upper().strip()] = via.strip()
+                    log.debug("Relay path recorded: %s via %s", fr, via)
+
         # Relay notifications
         cur.execute("""SELECT id, guid, relay_notification_time, frequency,
                               from_callsign, is_deleted, urgent
@@ -2293,22 +2842,27 @@ def poll_once():
             state["relay_hwm"] = max(state["relay_hwm"], row["id"])
             fr = row["from_callsign"] or ""
             # Skip relay notifications from our own home station
-            # (we just sent the message — no need to alert ourselves)
             if home_call_upper and fr.upper().startswith(home_call_upper.split("-")[0]):
                 log.debug("Skipping own relay notification from %s", fr)
                 continue
-            if _match(fr):
-                t = row["relay_notification_time"] or datetime.now(timezone.utc).isoformat()
-                freq_mhz = (row["frequency"] or 0) / 1_000_000
-                alerts.append({
-                    "id": f"relay-{row['id']}", "type": "relay",
-                    "time": t, "from_call": fr,
-                    "from_name": opname or fr,
-                    "relay_station": fr,
-                    "frequency_mhz": f"{freq_mhz:.4f}" if freq_mhz else "",
-                    "urgent": bool(row["urgent"]),
-                    "friendly_time": _friendly_time(t),
-                })
+            t = row["relay_notification_time"] or datetime.now(timezone.utc).isoformat()
+            freq_mhz = (row["frequency"] or 0) / 1_000_000
+            freq_str = f"{freq_mhz:.4f}" if freq_mhz else ""
+            urg = bool(row["urgent"])
+
+            # Process relay notification (tracking, queueing, cooldown)
+            _process_relay_notification(fr, freq_str, urg, t, opname)
+
+            # Always create the alert for UI display (regardless of relay automation)
+            alerts.append({
+                "id": f"relay-{row['id']}", "type": "relay",
+                "time": t, "from_call": fr,
+                "from_name": opname or fr,
+                "relay_station": fr,
+                "frequency_mhz": freq_str,
+                "urgent": urg,
+                "friendly_time": _friendly_time(t),
+            })
 
         conn.close()
 
@@ -2341,8 +2895,21 @@ def poll_once():
                     relay_info = f"Station {a.get('relay_station', 'unknown')} is holding a message for you"
                     if a.get("frequency_mhz"):
                         relay_info += f" ({a['frequency_mhz']} MHz)"
-                    relay_info += ". If VarAC is running, it may retrieve the message. Otherwise, the message may need to be collected manually from VarAC."
-                    send_pushover(f"Relay alert from {name}", relay_info)
+                    # Include relay automation status in notification
+                    with slock:
+                        rtrack = state["relay_tracking"].get(a.get("relay_station", "").upper(), {})
+                    rst = rtrack.get("status", "")
+                    if rst == "queued":
+                        relay_info += ". Auto-retrieval queued."
+                    elif rst == "confirmed_wait":
+                        relay_info += ". Awaiting your approval to auto-retrieve."
+                    elif rst == "retrieving":
+                        relay_info += ". Auto-retrieval in progress."
+                    else:
+                        relay_info += ". Open VarAC relay dialog to retrieve, or enable auto-retrieve in HamLink settings."
+                    send_pushover(f"Relay alert from {name}", relay_info,
+                                  relay_station=a.get("relay_station", ""),
+                                  relay_status=rst)
 
         with slock:
             state["last_poll"] = datetime.now(timezone.utc).isoformat()
@@ -2436,7 +3003,7 @@ def _kill_by_name(exe_name):
 
 def _cleanup():
     """Terminate all launched subprocesses and stop background threads."""
-    global _aprs_running, _kiss_running, _beacon_running, _shutdown_done
+    global _aprs_running, _kiss_running, _beacon_running, _relay_running, _shutdown_done
     if _shutdown_done:
         return
     _shutdown_done = True
@@ -2446,6 +3013,7 @@ def _cleanup():
     _aprs_running = False
     _kiss_running = False
     _beacon_running = False
+    _relay_running = False
 
     # Terminate launched subprocesses (direct references, not globals lookup)
     _kill_proc("VarAC", _varac_proc)
@@ -2612,6 +3180,18 @@ def api_status():
                 "via_aprsis": config.get("beacon", {}).get("via_aprsis", True),
                 "via_rf": config.get("beacon", {}).get("via_rf", True),
             },
+            "relay": {
+                "enabled": config.get("relay", {}).get("enabled", False),
+                "auto_retrieve": config.get("relay", {}).get("auto_retrieve", False),
+                "auto_retrieve_delay_seconds": config.get("relay", {}).get("auto_retrieve_delay_seconds", 10),
+                "confirm_before_connect": config.get("relay", {}).get("confirm_before_connect", True),
+                "max_retries": config.get("relay", {}).get("max_retries", 2),
+                "retry_delay_seconds": config.get("relay", {}).get("retry_delay_seconds", 120),
+                "cooldown_seconds": config.get("relay", {}).get("cooldown_seconds", 300),
+                "route_replies_via_relay": config.get("relay", {}).get("route_replies_via_relay", True),
+                "ignore_stations": list(config.get("relay", {}).get("ignore_stations", [])),
+                "min_snr": config.get("relay", {}).get("min_snr"),
+            },
         }
     # Resolve BBS directory outside cfglock to avoid deadlock
     cfg_snap["bbs_directory_resolved"] = get_bbs_directory() or ""
@@ -2666,6 +3246,46 @@ def api_ack_all():
         state["pending_alerts"] = []
     stop_speaker_alarm()
     return jsonify({"ok": True})
+
+@app.route("/api/delete_vmail", methods=["POST"])
+def api_delete_vmail():
+    """Hard-delete a VarAC vmail: set is_deleted=1 and read_status=1 in the
+    vmail table so the poll loop and HWM-init both skip it permanently."""
+    d = request.get_json(force=True)
+    aid = (d.get("id") or "").strip()
+    if not aid.startswith("vmail-"):
+        return jsonify({"ok": False, "error": "Not a VarAC vmail id"})
+    try:
+        vmail_id = int(aid.split("-", 1)[1])
+    except (ValueError, IndexError):
+        return jsonify({"ok": False, "error": "Bad vmail id"})
+    try:
+        conn = _connect()
+        cur = conn.cursor()
+        # Hard-delete the row — VarAC's own "delete" only sets is_deleted=1,
+        # which leaves the row visible in VarAC's UI. Purge attachments first.
+        cur.execute("SELECT guid FROM vmail WHERE id = ?", (vmail_id,))
+        row = cur.fetchone()
+        if row and row["guid"]:
+            cur.execute("DELETE FROM vmail_attachment WHERE vmail_guid = ?", (row["guid"],))
+        cur.execute("DELETE FROM vmail WHERE id = ?", (vmail_id,))
+        affected = cur.rowcount
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.error("Delete vmail %d failed: %s", vmail_id, e)
+        return jsonify({"ok": False, "error": str(e)})
+    with slock:
+        state["acknowledged_ids"].add(aid)
+        state["pending_alerts"] = [a for a in state["pending_alerts"] if a["id"] != aid]
+        state["history"] = [a for a in state["history"] if a.get("id") != aid]
+        # Advance HWM past this id so it can't be re-fetched this session
+        if vmail_id > state.get("vmail_hwm", 0):
+            state["vmail_hwm"] = vmail_id
+        if not state["pending_alerts"]:
+            stop_speaker_alarm()
+    log.info("VarAC vmail %d deleted (is_deleted=1, read_status=1), affected=%d", vmail_id, affected)
+    return jsonify({"ok": True, "affected": affected})
 
 @app.route("/api/dismiss_from_phone")
 def api_dismiss_from_phone():
@@ -3089,13 +3709,25 @@ def api_reply():
         now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         g = str(uuid.uuid4())
 
+        # Relay-aware reply routing: if the original message came via a relay,
+        # route the reply back through the same relay station
+        via = (d.get("relay_via") or "").strip()
+        if not via:
+            with cfglock:
+                route_via = config.get("relay", {}).get("route_replies_via_relay", True)
+            if route_via:
+                with slock:
+                    via = state.get("relay_paths", {}).get(to_call, "")
+        if via:
+            log.info("Reply to %s routed via relay %s", to_call, via)
+
         cur.execute("""INSERT INTO vmail
             (guid, creation_time, sent_time, received_time,
              folder_id, vmail_to, vmail_from, vmail_via,
              delivery_band, delivery_snr, subject, msg,
              read_status, is_deleted, frequency, has_attachment, urgent)
-            VALUES (?, ?, NULL, NULL, ?, ?, ?, '', '', '', ?, ?, 0, 0, 0, 0, 0)""",
-            (g, now_utc, outbox_id, to_call, home_call, subject, msg_text))
+            VALUES (?, ?, NULL, NULL, ?, ?, ?, ?, '', '', ?, ?, 0, 0, 0, 0, 0)""",
+            (g, now_utc, outbox_id, to_call, home_call, via, subject, msg_text))
 
         conn.commit()
         conn.close()
@@ -3103,12 +3735,14 @@ def api_reply():
         with slock:
             state["reply_status"] = {
                 "time": now_utc, "to": to_call,
-                "message": msg_text[:100], "status": "queued"
+                "message": msg_text[:100], "status": "queued",
+                "via": via,
             }
 
-        log.info("Reply queued to %s: %s", to_call, msg_text[:60])
+        via_msg = f" via relay {via}" if via else ""
+        log.info("Reply queued to %s%s: %s", to_call, via_msg, msg_text[:60])
         log_reply(to_call, msg_text, channel="varac")
-        return jsonify({"ok": True, "to": to_call})
+        return jsonify({"ok": True, "to": to_call, "via": via})
 
     except Exception as e:
         log.error("Reply failed: %s", e)
@@ -3132,7 +3766,7 @@ def api_set_config():
                 if pk in d["pushover"]:
                     config["pushover"][pk] = d["pushover"][pk]
         if "aprs" in d:
-            for ak in ["enabled", "home_ssid", "traveler_ssids", "passcode", "server", "port", "use_mailbox", "rf_fallback"]:
+            for ak in ["enabled", "home_ssid", "traveler_ssids", "passcode", "server", "port", "use_mailbox", "rf_fallback", "aprs_fi_api_key"]:
                 if ak in d["aprs"]:
                     config["aprs"][ak] = d["aprs"][ak]
         if "soundmodem" in d:
@@ -3147,6 +3781,12 @@ def api_set_config():
             for bk in ["enabled", "lat", "lon", "symbol_table", "symbol_code", "comment", "interval_minutes", "via_aprsis", "via_rf"]:
                 if bk in d["beacon"]:
                     config["beacon"][bk] = d["beacon"][bk]
+        if "relay" in d:
+            for rk in ["enabled", "auto_retrieve", "auto_retrieve_delay_seconds",
+                        "confirm_before_connect", "max_retries", "retry_delay_seconds",
+                        "cooldown_seconds", "route_replies_via_relay", "ignore_stations", "min_snr"]:
+                if rk in d["relay"]:
+                    config["relay"][rk] = d["relay"][rk]
         save_config(config)
         new_db = config.get("varac_db_path", "")
     if new_db != old_db and new_db and os.path.isfile(new_db):
@@ -3175,8 +3815,12 @@ def api_set_config():
     # Start beacon if enabled
     with cfglock:
         beacon_on = config.get("beacon", {}).get("enabled", False)
+        relay_on = config.get("relay", {}).get("enabled", False)
     if beacon_on:
         start_beacon()
+    # Start/restart relay thread if enabled
+    if relay_on:
+        start_relay()
     return jsonify({"ok": True})
 
 
@@ -3209,6 +3853,182 @@ def api_gen_passcode():
         return jsonify({"ok": False, "error": "No callsign"})
     pc = aprs_passcode(call)
     return jsonify({"ok": True, "passcode": str(pc)})
+
+
+# ---------------------------------------------------------------------------
+# Relay API endpoints
+# ---------------------------------------------------------------------------
+@app.route("/api/relay/status")
+def api_relay_status():
+    """Return relay tracking state for UI display."""
+    with slock:
+        return jsonify({
+            "ok": True,
+            "tracking": dict(state["relay_tracking"]),
+            "queue_length": len(state["relay_retrieval_queue"]),
+            "active": state["relay_retrieval_active"],
+            "pending_confirm": state["relay_pending_confirm"],
+            "relay_paths": dict(state["relay_paths"]),
+        })
+
+
+@app.route("/api/relay/approve", methods=["POST"])
+def api_relay_approve():
+    """Approve a pending relay retrieval (confirm_before_connect mode)."""
+    d = request.get_json(force=True)
+    relay_call = (d.get("relay_station") or "").strip().upper()
+    if not relay_call:
+        # If no specific station given, approve whatever is pending
+        with slock:
+            relay_call = state.get("relay_pending_confirm", "")
+    if not relay_call:
+        return jsonify({"ok": False, "error": "No relay pending confirmation"})
+
+    now_utc = datetime.now(timezone.utc).isoformat()
+    with slock:
+        entry = state["relay_tracking"].get(relay_call)
+        if not entry:
+            return jsonify({"ok": False, "error": f"No tracking entry for {relay_call}"})
+        if entry.get("status") != "confirmed_wait":
+            return jsonify({"ok": False, "error": f"Relay {relay_call} not awaiting confirmation (status: {entry.get('status')})"})
+        entry["status"] = "queued"
+        state["relay_pending_confirm"] = None
+        # Add to retrieval queue
+        if relay_call not in [q.get("relay_station", "").upper() for q in state["relay_retrieval_queue"]]:
+            state["relay_retrieval_queue"].append({
+                "relay_station": entry["relay_station"],
+                "frequency_mhz": entry.get("frequency_mhz", ""),
+                "queued_at": now_utc,
+            })
+    log.info("Relay retrieval approved for %s", relay_call)
+    # Ensure relay thread is running
+    start_relay()
+    return jsonify({"ok": True, "relay_station": relay_call})
+
+
+@app.route("/api/relay/dismiss", methods=["POST"])
+def api_relay_dismiss():
+    """Dismiss a pending relay retrieval."""
+    d = request.get_json(force=True)
+    relay_call = (d.get("relay_station") or "").strip().upper()
+    if not relay_call:
+        with slock:
+            relay_call = state.get("relay_pending_confirm", "")
+    if not relay_call:
+        return jsonify({"ok": False, "error": "No relay pending"})
+
+    with slock:
+        entry = state["relay_tracking"].get(relay_call)
+        if entry:
+            entry["status"] = "pending"
+        if state.get("relay_pending_confirm") == relay_call:
+            state["relay_pending_confirm"] = None
+    log.info("Relay retrieval dismissed for %s", relay_call)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/relay/retry", methods=["POST"])
+def api_relay_retry():
+    """Manually retry a failed relay retrieval."""
+    d = request.get_json(force=True)
+    relay_call = (d.get("relay_station") or "").strip().upper()
+    if not relay_call:
+        return jsonify({"ok": False, "error": "relay_station required"})
+
+    now_utc = datetime.now(timezone.utc).isoformat()
+    with slock:
+        entry = state["relay_tracking"].get(relay_call)
+        if not entry:
+            return jsonify({"ok": False, "error": f"No tracking entry for {relay_call}"})
+        entry["status"] = "queued"
+        entry["attempts"] = 0
+        entry["error"] = None
+        # Clear cooldown so retry can proceed immediately
+        state["relay_last_attempt"].pop(relay_call, None)
+        if relay_call not in [q.get("relay_station", "").upper() for q in state["relay_retrieval_queue"]]:
+            state["relay_retrieval_queue"].append({
+                "relay_station": entry["relay_station"],
+                "frequency_mhz": entry.get("frequency_mhz", ""),
+                "queued_at": now_utc,
+            })
+    log.info("Relay retrieval retry queued for %s", relay_call)
+    start_relay()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/relay/retrieve", methods=["POST"])
+def api_relay_retrieve():
+    """Manually trigger retrieval from a specific relay station (one-shot)."""
+    d = request.get_json(force=True)
+    relay_call = (d.get("relay_station") or "").strip()
+    if not relay_call:
+        return jsonify({"ok": False, "error": "relay_station required"})
+
+    relay_upper = relay_call.upper()
+    now_utc = datetime.now(timezone.utc).isoformat()
+
+    with slock:
+        # Create/update tracking entry
+        if relay_upper not in state["relay_tracking"]:
+            state["relay_tracking"][relay_upper] = {
+                "relay_station": relay_call,
+                "frequency_mhz": d.get("frequency_mhz", ""),
+                "first_seen": now_utc,
+                "last_seen": now_utc,
+                "notification_count": 0,
+                "urgent": False,
+                "status": "queued",
+                "last_attempt": None,
+                "attempts": 0,
+                "error": None,
+                "retrieved_vmail_ids": [],
+            }
+        else:
+            state["relay_tracking"][relay_upper]["status"] = "queued"
+            state["relay_tracking"][relay_upper]["attempts"] = 0
+            state["relay_tracking"][relay_upper]["error"] = None
+
+        # Clear cooldown and add to queue
+        state["relay_last_attempt"].pop(relay_upper, None)
+        if relay_upper not in [q.get("relay_station", "").upper() for q in state["relay_retrieval_queue"]]:
+            state["relay_retrieval_queue"].append({
+                "relay_station": relay_call,
+                "frequency_mhz": d.get("frequency_mhz", ""),
+                "queued_at": now_utc,
+            })
+
+    log.info("Manual relay retrieval queued for %s", relay_call)
+    start_relay()
+    return jsonify({"ok": True, "relay_station": relay_call})
+
+
+@app.route("/api/relay/approve_from_phone")
+def api_relay_approve_from_phone():
+    """Approve relay retrieval from a Pushover notification link (GET, no CSRF)."""
+    station = request.args.get("station", "").strip().upper()
+    if not station:
+        return "<h2>No relay station specified</h2>", 400
+    now_utc = datetime.now(timezone.utc).isoformat()
+    with slock:
+        entry = state["relay_tracking"].get(station)
+        if not entry:
+            return f"<h2>No tracking entry for {station}</h2>", 404
+        if entry.get("status") != "confirmed_wait":
+            return f"<h2>Relay {station} is not awaiting confirmation (status: {entry.get('status')})</h2>", 400
+        entry["status"] = "queued"
+        state["relay_pending_confirm"] = None
+        if station not in [q.get("relay_station", "").upper() for q in state["relay_retrieval_queue"]]:
+            state["relay_retrieval_queue"].append({
+                "relay_station": entry["relay_station"],
+                "frequency_mhz": entry.get("frequency_mhz", ""),
+                "queued_at": now_utc,
+            })
+    log.info("Relay retrieval approved from phone for %s", station)
+    start_relay()
+    return f"""<html><body style="font-family:sans-serif;text-align:center;padding:40px">
+        <h2 style="color:#16a34a">Relay Retrieval Approved</h2>
+        <p>HamLink will now connect to <b>{station}</b> to retrieve your VMail.</p>
+        </body></html>"""
 
 
 @app.route("/api/test_db", methods=["POST"])
@@ -3956,6 +4776,9 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
         <div class="fg"><div class="tgl-row"><label class="fl" style="margin:0">Copy messages to APRS Mailbox (NA7Q store &amp; forward)</label>
           <div class="tgl" id="cAprsMailbox" onclick="this.classList.toggle('on')"></div></div>
           <div class="fhint">Also sends a copy to the MAIL bot so the traveler can retrieve it later with APRSM, even with spotty coverage</div></div>
+        <div class="fg"><label class="fl">aprs.fi API Key (optional)</label>
+          <input class="fi" id="cAprsFiKey" placeholder="get one free at aprs.fi/account/me" type="password">
+          <div class="fhint">On startup, queries aprs.fi for the traveler's latest position so you see movement that happened while HamLink was off. Leave blank to disable.</div></div>
       </div>
 
       <div class="sett-section">
@@ -4046,6 +4869,34 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
             <strong>FCC Part 97.221:</strong> RF beacons via Soundmodem exceed the 500 Hz bandwidth limit for automatically controlled digital stations. Enabling this requires a licensed amateur radio operator to be present at or supervising the station. In an emergency involving immediate safety of life or property, the emergency exception (FCC Part 97.403) may apply.
           </div>
           <div class="fhint">RF beaconing helps iGates relay messages to you when internet is down. Off by default — requires a licensed operator present or supervising (97.221).</div></div>
+      </div>
+
+      <div class="sett-section">
+        <h3>VMail Relay Automation</h3>
+        <div class="fg"><div class="tgl-row"><label class="fl" style="margin:0">Enable Relay Features</label>
+          <div class="tgl" id="cRelayOn" onclick="this.classList.toggle('on')"></div></div>
+          <div class="fhint">Enhanced relay notification tracking, filtering, and reply routing via relay stations</div></div>
+        <div class="fg"><div class="tgl-row"><label class="fl" style="margin:0">Auto-Retrieve VMails</label>
+          <div class="tgl" id="cRelayAutoRetrieve" onclick="this.classList.toggle('on')"></div></div>
+          <div class="fhint">Automatically connect to relay stations and download pending VMails using VarAC UI automation. Requires VarAC to be running.</div></div>
+        <div class="fg"><div class="tgl-row"><label class="fl" style="margin:0">Confirm Before Connecting</label>
+          <div class="tgl on" id="cRelayConfirm" onclick="this.classList.toggle('on')"></div></div>
+          <div class="fhint">Show an approval prompt before auto-connecting. Recommended — gives you visibility before VarAC QSYs to a relay frequency.</div></div>
+        <div class="fg"><div class="tgl-row"><label class="fl" style="margin:0">Route Replies via Relay</label>
+          <div class="tgl on" id="cRelayRouteReplies" onclick="this.classList.toggle('on')"></div></div>
+          <div class="fhint">Automatically route VarAC replies through the relay station that delivered the original message</div></div>
+        <div class="fg"><label class="fl">Cooldown Between Retrievals (seconds)</label>
+          <input class="fi" id="cRelayCooldown" type="number" min="60" max="3600" value="300" style="width:120px">
+          <div class="fhint">Minimum time between auto-retrieval attempts from the same relay station (60-3600s)</div></div>
+        <div class="fg"><label class="fl">Delay Before Auto-Retrieve (seconds)</label>
+          <input class="fi" id="cRelayDelay" type="number" min="0" max="120" value="10" style="width:120px">
+          <div class="fhint">Wait time after notification before attempting retrieval</div></div>
+        <div class="fg"><label class="fl">Max Retries</label>
+          <input class="fi" id="cRelayMaxRetries" type="number" min="0" max="5" value="2" style="width:80px">
+          <div class="fhint">How many times to retry a failed retrieval</div></div>
+        <div class="fg"><label class="fl">Ignore Stations (comma-separated)</label>
+          <input class="fi" id="cRelayIgnore" placeholder="e.g. W5XYZ, N0CALL" style="width:300px">
+          <div class="fhint">Relay station callsigns to never auto-connect to</div></div>
       </div>
 
       <div class="sett-section">
@@ -4261,6 +5112,7 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
           <input type="checkbox" id="chkVarac" checked> VarAC <span style="color:var(--text3)" id="varacPathLabel">(queued to outbox)</span></label>
       </div>
     </div>
+    <div id="relayViaIndicator" style="display:none;margin-top:6px;padding:6px 10px;background:#f5f3ff;border:1px solid #c4b5fd;border-radius:6px"></div>
     <div id="rfWarning" style="display:none;background:#fef3c7;border:1px solid #f59e0b;border-radius:8px;padding:10px;font-size:12px;color:#92400e;margin-top:10px">
       <strong>RF Transmission:</strong> One or more selected channels will transmit over radio.
       Only licensed amateur radio operators or authorized third parties under direct supervision
@@ -4415,6 +5267,23 @@ function _openComposeBox(chan){
   document.getElementById('wlPathLabel').style.color=wlRf?'#b45309':'var(--text3)';
   document.getElementById('varacPathLabel').textContent='(queued to outbox)';
   document.getElementById('varacPathLabel').style.color='var(--text3)';
+  // Show relay routing indicator for VarAC replies
+  var relayViaEl=document.getElementById('relayViaIndicator');
+  if(relayViaEl){
+    var toCall=(_replyToCall||'').toUpperCase();
+    var relayPaths=(window._relayTracking?{}:{}); // from relay status
+    try{relayPaths=window._relayPaths||{}}catch(e){}
+    var viaStation='';
+    if(cfg.relay&&cfg.relay.route_replies_via_relay&&toCall){
+      // Check relay_paths from last status poll
+      var rd=window._relayData||{};
+      viaStation=(rd.relay_paths||{})[toCall]||'';
+    }
+    if(viaStation){
+      relayViaEl.innerHTML='<span style="font-size:11px;color:#7c3aed;font-weight:600">📡 Reply via relay '+esc(viaStation)+'</span>';
+      relayViaEl.style.display='block';
+    }else{relayViaEl.style.display='none'}
+  }
   // Show RF warning and update on checkbox change
   function updateRfWarning(){
     var anyRf=false;
@@ -4701,6 +5570,7 @@ async function fillForm(){
   document.getElementById('cAprsPort').value=ap.port||14580;
   document.getElementById('cAprsRfFallback').classList.toggle('on',!!ap.rf_fallback);
   document.getElementById('cAprsMailbox').classList.toggle('on',!!ap.use_mailbox);
+  document.getElementById('cAprsFiKey').value=ap.aprs_fi_api_key||'';
   document.getElementById('cMapState').value=c.map_state||'';
   const bcn=c.beacon||{};
   document.getElementById('cBcnOn').classList.toggle('on',!!bcn.enabled);
@@ -4713,6 +5583,15 @@ async function fillForm(){
   document.getElementById('cBcnComment').value=bcn.comment||'HamLink Radio';
   document.getElementById('cBcnAprsIs').classList.toggle('on',bcn.via_aprsis!==false);
   document.getElementById('cBcnRf').classList.toggle('on',!!bcn.via_rf);
+  const rl=c.relay||{};
+  document.getElementById('cRelayOn').classList.toggle('on',!!rl.enabled);
+  document.getElementById('cRelayAutoRetrieve').classList.toggle('on',!!rl.auto_retrieve);
+  document.getElementById('cRelayConfirm').classList.toggle('on',rl.confirm_before_connect!==false);
+  document.getElementById('cRelayRouteReplies').classList.toggle('on',rl.route_replies_via_relay!==false);
+  document.getElementById('cRelayCooldown').value=rl.cooldown_seconds||300;
+  document.getElementById('cRelayDelay').value=rl.auto_retrieve_delay_seconds||10;
+  document.getElementById('cRelayMaxRetries').value=rl.max_retries||2;
+  document.getElementById('cRelayIgnore').value=(rl.ignore_stations||[]).join(', ');
   const sm=c.soundmodem||{};
   document.getElementById('cSmOn').classList.toggle('on',!!sm.enabled);
   document.getElementById('cSmPath').value=sm.exe_path||'';
@@ -4777,6 +5656,7 @@ async function saveSett(){
       port:parseInt(document.getElementById('cAprsPort').value)||14580,
       rf_fallback:document.getElementById('cAprsRfFallback').classList.contains('on'),
       use_mailbox:document.getElementById('cAprsMailbox').classList.contains('on'),
+      aprs_fi_api_key:document.getElementById('cAprsFiKey').value.trim(),
     },
     beacon:{
       enabled:document.getElementById('cBcnOn').classList.contains('on'),
@@ -4788,6 +5668,18 @@ async function saveSett(){
       interval_minutes:parseInt(document.getElementById('cBcnInterval').value)||30,
       via_aprsis:document.getElementById('cBcnAprsIs').classList.contains('on'),
       via_rf:document.getElementById('cBcnRf').classList.contains('on'),
+    },
+    relay:{
+      enabled:document.getElementById('cRelayOn').classList.contains('on'),
+      auto_retrieve:document.getElementById('cRelayAutoRetrieve').classList.contains('on'),
+      confirm_before_connect:document.getElementById('cRelayConfirm').classList.contains('on'),
+      route_replies_via_relay:document.getElementById('cRelayRouteReplies').classList.contains('on'),
+      cooldown_seconds:parseInt(document.getElementById('cRelayCooldown').value)||300,
+      auto_retrieve_delay_seconds:parseInt(document.getElementById('cRelayDelay').value)||10,
+      max_retries:parseInt(document.getElementById('cRelayMaxRetries').value)||2,
+      retry_delay_seconds:120,
+      ignore_stations:(document.getElementById('cRelayIgnore').value||'').split(',').map(s=>s.trim()).filter(Boolean),
+      min_snr:null,
     },
     soundmodem:{
       enabled:document.getElementById('cSmOn').classList.contains('on'),
@@ -5024,6 +5916,8 @@ let seenIds=new Set();
 async function poll(){
   try{
     const r=await fetch('/api/status');const d=await r.json();cfg=d.config;if(d.csrf_token)csrfToken=d.csrf_token;ui(d);
+    // Poll relay tracking status if relay feature is enabled
+    if(cfg.relay&&cfg.relay.enabled){try{const rr=await fetch('/api/relay/status');const rd=await rr.json();if(rd.ok){window._relayTracking=rd.tracking||{};window._relayData=rd}}catch(e){}}
   }catch(e){
     document.getElementById('connDot').className='conn-dot err';
     document.getElementById('connText').textContent='Connection lost';
@@ -5216,6 +6110,31 @@ function dismissAll(){
   render();
 }
 
+/* --- Relay actions --- */
+function relayApprove(station){
+  cpost('/api/relay/approve',{relay_station:station}).then(r=>r.json()).then(d=>{
+    if(d.ok){log('Relay retrieval approved for '+station);poll()}
+    else{log('Relay approve failed: '+(d.error||'unknown'))}
+  }).catch(e=>log('Relay approve error: '+e));
+}
+function relayDismissAction(station){
+  cpost('/api/relay/dismiss',{relay_station:station}).then(r=>r.json()).then(d=>{
+    if(d.ok){log('Relay dismissed: '+station);poll()}
+  }).catch(e=>log('Relay dismiss error: '+e));
+}
+function relayRetry(station){
+  cpost('/api/relay/retry',{relay_station:station}).then(r=>r.json()).then(d=>{
+    if(d.ok){log('Relay retry queued: '+station);poll()}
+    else{log('Relay retry failed: '+(d.error||'unknown'))}
+  }).catch(e=>log('Relay retry error: '+e));
+}
+function relayRetrieveNow(station,freqMhz){
+  cpost('/api/relay/retrieve',{relay_station:station,frequency_mhz:freqMhz||''}).then(r=>r.json()).then(d=>{
+    if(d.ok){log('Relay retrieval queued: '+station);poll()}
+    else{log('Relay retrieve failed: '+(d.error||'unknown'))}
+  }).catch(e=>log('Relay retrieve error: '+e));
+}
+
 function render(){
   const d=window._d;if(!d)return;
   // "alerting" = pending and not dismissed (alarm should sound)
@@ -5235,6 +6154,20 @@ function render(){
   const h=[...d.history].filter(a=>!pendingIds.has(a.id)).reverse();
   if(!h.length){ha.innerHTML='<div class="empty"><div class="icon">📋</div><p>No messages yet</p></div>'}
   else{ha.innerHTML=h.slice(0,50).map(a=>card(a,false)).join('')}
+}
+
+function deleteVmail(id){
+  if(!confirm('Permanently delete this VarAC message? It will be marked is_deleted=1 in VarAC.db and will not reappear.'))return;
+  dismissedIds.add(id);
+  cpost('/api/delete_vmail',{id:id});
+  const d=window._d;
+  if(d){
+    d.pending=d.pending.filter(a=>a.id!==id);
+    if(d.history)d.history=d.history.filter(a=>a.id!==id);
+    const remaining=d.pending.filter(a=>!dismissedIds.has(a.id));
+    if(remaining.length===0){stopAlarm();cpost('/api/stop_alarm');}
+  }
+  render();
 }
 
 function closeMessage(id){
@@ -5300,7 +6233,21 @@ function card(a,isActive){
   const subj=a.subject?`<div class="msg-subject">${esc(a.subject)}</div>`:'';
   const body=(a.type==='vmail'||a.type==='aprs'||a.type==='winlink')&&a.message
     ?`<div class="msg-body">${esc(a.message)}</div>`
-    :a.type==='relay'?'<div class="msg-body">Station <b>'+(a.relay_station||'unknown')+'</b> is holding a message for you'+(a.frequency_mhz?' on '+a.frequency_mhz+' MHz':'')+'.<br>If VarAC is running, it may retrieve the message automatically. Otherwise, you may need to connect to that station manually from VarAC to collect it.</div>':'';
+    :a.type==='relay'?(function(){
+      var rs=a.relay_station||'unknown';
+      var rk=rs.toUpperCase();
+      var rt=(window._relayTracking||{})[rk]||{};
+      var st=rt.status||'';
+      var statusHtml='';
+      if(st==='queued')statusHtml='<div style="font-size:11px;margin-top:6px;color:#2563eb;font-weight:600">⏳ Auto-retrieval queued</div>';
+      else if(st==='retrieving')statusHtml='<div style="font-size:11px;margin-top:6px;color:#d97706;font-weight:600">📡 Connecting to relay...</div>';
+      else if(st==='retrieved')statusHtml='<div style="font-size:11px;margin-top:6px;color:#16a34a;font-weight:600">✓ Retrieved</div>';
+      else if(st==='failed')statusHtml='<div style="font-size:11px;margin-top:6px;color:#dc2626;font-weight:600">✕ Retrieval failed'+(rt.error?' — '+esc(rt.error):'')+'</div><button class="btn-small" onclick="relayRetry(\''+esc(rs)+'\')">Retry</button>';
+      else if(st==='confirmed_wait')statusHtml='<div style="font-size:11px;margin-top:6px;color:#d97706;font-weight:600">⚠ Awaiting your approval</div><button class="btn-small primary" onclick="relayApprove(\''+esc(rs)+'\')">Approve Retrieval</button> <button class="btn-small" onclick="relayDismissAction(\''+esc(rs)+'\')" style="color:var(--text2)">Dismiss</button>';
+      var bodyTxt='Station <b>'+esc(rs)+'</b> is holding a message for you'+(a.frequency_mhz?' on '+a.frequency_mhz+' MHz':'')+'.';
+      if(!st||st==='pending')bodyTxt+='<br><button class="btn-small primary" onclick="relayRetrieveNow(\''+esc(rs)+'\',\''+esc(a.frequency_mhz||'')+'\')">Retrieve Now</button>';
+      return '<div class="msg-body">'+bodyTxt+statusHtml+'</div>';
+    })():'';
 
   const replyChan=a.type==='aprs'?'aprs':a.type==='winlink'?'winlink':'varac';
   const replyTo=a.from_call||'';
@@ -5310,10 +6257,12 @@ function card(a,isActive){
   if(isActive){
     const dismissBtn=!dismissed?`<button class="btn-small" onclick="dismiss('${a.id}')" style="color:var(--text2)">🔕 Dismiss Alert</button>`:'';
     const closeBtn=`<button class="btn-small" onclick="closeMessage('${a.id}')" style="color:var(--text3)">✕ Close</button>`;
+    const delBtn=a.type==='vmail'?`<button class="btn-small" onclick="deleteVmail('${a.id}')" style="color:#dc2626">🗑 Delete</button>`:'';
     actions=`<div class="msg-actions">
         ${dismissBtn}
         <button class="btn-small primary" onclick="openReply('${replyChan}','${esc(replyTo)}')">Reply</button>
         ${closeBtn}
+        ${delBtn}
       </div>`;
   }
 
@@ -5526,6 +6475,9 @@ if __name__ == "__main__":
         # Start beacon if enabled
         if config.get("beacon", {}).get("enabled", False):
             start_beacon()
+        # Start relay retrieval thread if enabled
+        if config.get("relay", {}).get("enabled", False):
+            start_relay()
         log.info("All external services launched")
 
     threading.Thread(target=_deferred_launches, daemon=True).start()
