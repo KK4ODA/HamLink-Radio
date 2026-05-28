@@ -88,6 +88,32 @@ HamLink Radio is a family emergency communications app for licensed amateur radi
 - Only skip messages FROM the exact home callsign (`KK4ODA`), NOT portable variants (`KK4ODA/P`)
 - `startswith()` was too broad — `KK4ODA/P` starts with `KK4ODA` but is the traveler
 
+### VarAC Vmail Deletion (added 2026-05-27)
+- **VarAC's "delete" is soft-only** — it just sets `vmail.is_deleted = 1`. The row stays in `VarAC.db` and remains visible in VarAC's own inbox view, so users perceive "deleted" messages as coming back.
+- HamLink's poll query filters `is_deleted = 0`, so soft-deleted rows do NOT alert in HamLink — but they still show in VarAC.
+- **`/api/delete_vmail`** endpoint does a HARD `DELETE FROM vmail WHERE id=?` (plus `DELETE FROM vmail_attachment WHERE vmail_guid=?` for any attachments — note the join column is `vmail_guid`, not `vmail_id`). Advances `vmail_hwm` past the deleted id so it can't be re-fetched.
+- **🗑 Delete button** on every vmail card in the UI (red, next to ✕ Close). Confirmation prompt before purge.
+- When fixing user reports of "deleted vmails keep coming back in VarAC," the fix is a hard DELETE while VarAC is closed. Always back up `VarAC.db` first.
+
+### Relay Automation (added in monitor.py — see `relay` config block)
+- `varac_retrieve_relay()` automates VarAC's UI to retrieve vmails held by a relay station — uses `pywin32` + `UIAutomationCore` to click the RELAY status bar label and double-click the callsign in the DataGridView.
+- State: `state["relay_tracking"]`, `relay_retrieval_queue`, `relay_pending_confirm`, `relay_last_attempt` (cooldown), `relay_paths` (for reply routing).
+- Config knobs: `relay{enabled, auto_retrieve, auto_retrieve_delay_seconds, confirm_before_connect, max_retries, retry_delay_seconds, cooldown_seconds, route_replies_via_relay, ignore_stations, min_snr}`.
+- Reply routing: if a vmail arrived via a relay, replies are auto-routed back through the same relay (set `relay.route_replies_via_relay` to disable).
+
+### aprs.fi Backfill (added)
+- On startup, `_aprs_fi_backfill()` queries `https://api.aprs.fi/api/get` for all traveler SSIDs.
+- If aprs.fi has a newer position than what's persisted in `.last_position.json`, the saved position is updated.
+- Covers the gap when HamLink was offline while traveler moved — APRS-IS doesn't replay history on reconnect.
+- Requires `config.aprs.aprs_fi_api_key`. Silently skips if no key or no internet.
+
+## Releases (added 2026-05-27)
+
+- **Workflow:** `.github/workflows/release.yml` — triggered on `push: tags: ['v*']`.
+- **Process:** `git tag -a v0.2.0 -m "v0.2.0" && git push origin v0.2.0` → CI builds `HamLink-v0.2.0.zip` via `git archive` (tracked files only, no config.json or logs leak) and publishes a GitHub release with an auto-generated changelog grouped by conventional-commit prefix (`feat:` → Features, `fix:` → Bug fixes, `docs:`, `chore|refactor|ci|build|perf|test|style` → Chores, else → Misc).
+- **Current release:** `v0.1.0` (initial release after rebrand from HomeLink). The old `HomeLink Radio v1.0.0` release was deleted.
+- **Tip:** Use `feat:` / `fix:` prefixes in commit messages going forward so the changelog auto-organizes nicely.
+
 ## File Structure
 
 ```
@@ -103,13 +129,21 @@ message_log.csv     — Message history CSV (gitignored)
 static/             — Leaflet.js, CSS, marker icons (for offline maps)
 tiles/              — MBTiles files for offline maps (gitignored)
 tiles/README.txt    — Instructions for downloading tiles
+.github/workflows/release.yml — Release automation (tag v* → GitHub release)
+.github/ISSUE_TEMPLATE/        — Bug report & feature request templates
 ```
 
 ## Config Structure (config.json)
 
 Key fields: `home_callsign`, `watch_callsigns[]`, `operator_name`, `varac_db_path`, `varac_exe_path`, `map_state`
 
-Nested: `aprs{enabled, home_ssid, traveler_ssids, rf_fallback, use_mailbox}`, `soundmodem{enabled, exe_path, kiss_port}`, `pat{enabled, exe_path, poll_interval, rf_fallback, rf_poll_interval, rf_gateway, position_reports, home_tactical, traveler_tactical}`, `beacon{enabled, lat, lon, via_aprsis, via_rf}`, `pushover{enabled, user_key, api_token, quick_replies}`
+Nested:
+- `aprs{enabled, home_ssid, traveler_ssids, rf_fallback, use_mailbox, aprs_fi_api_key}`
+- `soundmodem{enabled, exe_path, kiss_port}`
+- `pat{enabled, exe_path, poll_interval, rf_fallback, rf_poll_interval, rf_gateway, position_reports, home_tactical, traveler_tactical}`
+- `beacon{enabled, lat, lon, via_aprsis, via_rf}`
+- `pushover{enabled, user_key, api_token, quick_replies}`
+- `relay{enabled, auto_retrieve, auto_retrieve_delay_seconds, confirm_before_connect, max_retries, retry_delay_seconds, cooldown_seconds, route_replies_via_relay, ignore_stations, min_snr}`
 
 ## Testing Notes
 
