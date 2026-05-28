@@ -1,0 +1,92 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history for changelog)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute version and previous tag
+        id: ver
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"           # e.g. v0.1.0
+          VERSION="${TAG#v}"                 # e.g. 0.1.0
+          PREV_TAG=$(git tag --sort=-v:refname | grep -v "^${TAG}$" | head -n1 || true)
+          echo "tag=$TAG"            >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION"    >> "$GITHUB_OUTPUT"
+          echo "prev_tag=$PREV_TAG"  >> "$GITHUB_OUTPUT"
+          echo "Tag=$TAG Version=$VERSION Prev=$PREV_TAG"
+
+      - name: Build source zip
+        id: zip
+        shell: bash
+        run: |
+          TAG="${{ steps.ver.outputs.tag }}"
+          NAME="HamLink-${TAG}"
+          # git archive ships only tracked files at the tag — clean, no config.json, no csv
+          git archive --format=zip --prefix="${NAME}/" -o "${NAME}.zip" "${TAG}"
+          ls -la "${NAME}.zip"
+          echo "asset=${NAME}.zip" >> "$GITHUB_OUTPUT"
+
+      - name: Generate grouped changelog
+        id: changelog
+        shell: bash
+        run: |
+          TAG="${{ steps.ver.outputs.tag }}"
+          PREV="${{ steps.ver.outputs.prev_tag }}"
+          if [ -z "$PREV" ]; then
+            RANGE="$TAG"
+            HEADER="Initial release."
+          else
+            RANGE="${PREV}..${TAG}"
+            HEADER="Changes since [\`${PREV}\`](https://github.com/${GITHUB_REPOSITORY}/releases/tag/${PREV})."
+          fi
+
+          # Pull commits as "<short-sha> <subject>"
+          LOG=$(git log --no-merges --pretty=format:'%h %s' "$RANGE")
+
+          feats=$(echo "$LOG"  | grep -iE '^[0-9a-f]+ (feat|feature)(\(.+\))?:'     || true)
+          fixes=$(echo "$LOG"  | grep -iE '^[0-9a-f]+ fix(\(.+\))?:'                 || true)
+          docs=$(echo "$LOG"   | grep -iE '^[0-9a-f]+ docs?(\(.+\))?:'               || true)
+          chores=$(echo "$LOG" | grep -iE '^[0-9a-f]+ (chore|refactor|ci|build|perf|test|style)(\(.+\))?:' || true)
+          # "Misc" = everything not matched above
+          misc=$(echo "$LOG"   | grep -ivE '^[0-9a-f]+ (feat|feature|fix|docs?|chore|refactor|ci|build|perf|test|style)(\(.+\))?:' || true)
+
+          {
+            echo "## Changelog"
+            echo ""
+            echo "$HEADER"
+            echo ""
+            if [ -n "$feats" ];  then echo "### Features";  echo ""; echo "$feats"  | sed 's/^/- /'; echo ""; fi
+            if [ -n "$fixes" ];  then echo "### Bug fixes"; echo ""; echo "$fixes"  | sed 's/^/- /'; echo ""; fi
+            if [ -n "$docs" ];   then echo "### Docs";      echo ""; echo "$docs"   | sed 's/^/- /'; echo ""; fi
+            if [ -n "$chores" ]; then echo "### Chores";    echo ""; echo "$chores" | sed 's/^/- /'; echo ""; fi
+            if [ -n "$misc" ];   then echo "### Misc";      echo ""; echo "$misc"   | sed 's/^/- /'; echo ""; fi
+            if [ -n "$PREV" ]; then
+              echo "**Full diff:** https://github.com/${GITHUB_REPOSITORY}/compare/${PREV}...${TAG}"
+            fi
+          } > RELEASE_NOTES.md
+
+          echo "----- generated notes -----"
+          cat RELEASE_NOTES.md
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.ver.outputs.tag }}" \
+            "${{ steps.zip.outputs.asset }}" \
+            --title "${{ steps.ver.outputs.tag }}" \
+            --notes-file RELEASE_NOTES.md
