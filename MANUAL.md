@@ -1,6 +1,6 @@
 # HamLink Radio — User Manual
 
-**Version 1.0 | April 2026**
+**Version 0.2.0 | September 2026**
 
 HamLink Radio is a family emergency communications application for licensed amateur radio operators. It monitors multiple radio channels (VarAC, APRS, and Winlink) for check-in messages from a traveling family member and enables the home station operator to send replies via the internet, post situation reports for VarAC pickup or relay, and receive phone notifications via the internet — all from a simple web interface.
 
@@ -42,8 +42,8 @@ The licensed operator (the traveler) is ultimately responsible for all transmiss
 
 | Component | Details |
 |-----------|---------|
-| **Python** | Version 3.8 or higher ([python.org](https://www.python.org/downloads/)) |
-| **VarAC** | Version 5 or later ([varac.net](https://varac.net)) |
+| **Python** | Version 3.8 or higher ([python.org](https://www.python.org/downloads/)) — not needed if you use the standalone `.exe` from the [releases page](https://github.com/KK4ODA/HamLink-Radio/releases/latest) |
+| **VarAC** | Version 5 or later ([varac-hamradio.com](https://www.varac-hamradio.com/)) |
 | **VARA HF Modem** | Required by VarAC for digital communications |
 | **Windows PC** | Windows 10 or later (the home station computer) |
 
@@ -56,36 +56,51 @@ The licensed operator (the traveler) is ultimately responsible for all transmiss
 | **VARA FM Modem** | Enables Winlink RF gateway fallback |
 | **Pushover Account** | Phone notifications ($5 one-time, [pushover.net](https://pushover.net)) |
 
-### Python Libraries (auto-installed)
+### Python Libraries (auto-installed from `requirements.txt`)
 
 - `flask` — Web server framework
 - `aprslib` — APRS-IS protocol support (optional, for APRS features)
+- `pywin32`, `comtypes` — Windows only; VarAC broadcast and relay UI automation
 
 ---
 
 ## 3. Installation
 
-### Step 1: Download HamLink Radio
+### Option A: Standalone Windows app (no Python required)
 
-Place these files in a folder (e.g., `C:\HamLink\`):
+1. Download `HamLink-Radio-vX.Y.Z-win64.zip` from the [latest release](https://github.com/KK4ODA/HamLink-Radio/releases/latest)
+2. Unzip it to a folder of your choice (e.g., `C:\HamLink\`)
+3. Run `HamLink_Radio.exe`. It creates `config.json` next to itself on first launch and opens the dashboard
+
+Skip to [First Launch](#4-first-launch).
+
+### Option B: Run from source
+
+#### Step 1: Download HamLink Radio
+
+Download the source zip from the release page (or clone the repository) and unzip it to a folder (e.g., `C:\HamLink\`). You need at least:
 - `monitor.py` — The application
 - `start_hamlink.bat` — Launcher script
-- `build_hamlink_exe.bat` — Optional build script
+- `requirements.txt` — Python dependencies
+- `static/` — Map library for the offline map tab
 
-### Step 2: Run the Launcher
+#### Step 2: Run the Launcher
 
 Double-click `start_hamlink.bat`. It will:
 
 1. Check that Python 3.8+ is installed
 2. Verify pip is available
-3. Install Flask if not present
-4. Install aprslib if not present
-5. Check for Pat (optional)
-6. Launch HamLink Radio
+3. Install the dependencies from `requirements.txt` if any are missing
+4. Check for Pat (optional)
+5. Launch HamLink Radio
 
-The launcher displays version information and opens your browser to `http://127.0.0.1:5000`.
+The launcher opens your browser to `http://127.0.0.1:5000`.
 
-### Step 3: Install Python (if needed)
+#### Try it without any radio software
+
+Set the environment variable `HAMLINK_DEMO=1` before starting (`set HAMLINK_DEMO=1` then `python monitor.py`). The dashboard is filled with sample messages and a position so you can explore the interface. Nothing is transmitted, no external programs are launched, and no VarAC database is opened.
+
+#### Step 3: Install Python (if needed)
 
 If the launcher reports Python is missing:
 
@@ -93,7 +108,7 @@ If the launcher reports Python is missing:
 2. **Important:** Check "Add Python to PATH" during installation
 3. Restart the launcher
 
-### Step 4: Network Access (optional)
+#### Step 4: Network Access (optional)
 
 To access HamLink Radio from a phone or tablet on the same Wi-Fi network, use the PC's local IP address instead of `127.0.0.1`. For example: `http://192.168.1.100:5000`.
 
@@ -271,18 +286,18 @@ The main screen shows:
 
 - **Status Card** — Displays the current monitoring state:
   - Green: Last check-in received (shows time and sender name)
-  - Gray: Waiting for messages
+  - Neutral: Waiting for messages
   - Red: New unread alert (pulsing border)
-- **Connection Indicators** — Shows which channels are active (VarAC, APRS-IS, KISS/RF, Winlink)
-- **Position Card** — Shows the traveler's last known location from APRS beacons or Winlink position reports (whichever is most recent). The APRS position is saved to disk and persists across restarts. The card pulses green with a "NEW" badge when the position or timestamp changes; click "✓ Seen" to acknowledge. Includes a "View on Google Maps" link
+- **Connection Pills** — Under the status: Internet, VarAC, APRS-IS, APRS RF, and Winlink. Green means connected, amber means connecting or degraded, red means an error. Pills for channels that are turned off are hidden
+- **Position Card** — Shows the traveler's last known location from APRS beacons or Winlink position reports (whichever is most recent). The APRS position is saved to disk and persists across restarts. The card pulses green with a "NEW" badge when the position or timestamp changes; click "✓ Seen" to acknowledge. Includes Google Maps and offline map links
 - **Send Message Button** — Opens the compose box
-- **Post Sitrep to BBS Button** — Opens the sitrep form
-- **New Messages** — Pending alerts with "Got it" and "Reply" buttons
-- **Previous Messages** — Acknowledged message history
+- **Post Sitrep to BBS Button** — Opens the sitrep form (shown when a BBS directory is available)
+- **New Messages** — Pending alerts. Each card is colour-coded by channel (VarAC purple, APRS blue, Winlink amber, relay orange) and has **Dismiss alert**, **Reply**, **Close**, and (for VarAC) **Delete** buttons
+- **Previous Messages** — Acknowledged message history, including messages you sent with their delivery status
 - **Saved Message Log** — Toggleable CSV log of all messages
 - **Stop HamLink** — Button at the bottom to gracefully shut down the app and all associated programs
 
-The main interface has two tabs at the top: **Dashboard** (the main view) and **Offline Map** (interactive map showing the traveler's position using locally stored map tiles — works without internet).
+The header has two tabs: **Dashboard** (the main view) and **Offline Map** (interactive map showing the traveler's position using locally stored map tiles — works without internet). The 🌙/☀️ button switches between light and dark themes; the choice is remembered in the browser.
 
 ### 6.2 Receiving Alerts
 
@@ -671,28 +686,23 @@ If the traveler is operating from outside the United States:
 
 ## 11. Building a Standalone EXE
 
-You can build HamLink Radio as a single `.exe` file that runs without a Python installation.
-
-### Prerequisites
-
-Install PyInstaller:
-```
-pip install pyinstaller
-```
+Every GitHub release already includes a prebuilt `HamLink-Radio-vX.Y.Z-win64.zip`. Build your own only if you have changed the code.
 
 ### Build
 
-Double-click `build_hamlink_exe.bat` or run:
+Double-click `build_hamlink_exe.bat`. It installs the dependencies and PyInstaller, then runs:
 ```
-pyinstaller --onefile --name HamLink_Radio monitor.py
+pyinstaller --onefile --name HamLink_Radio --icon docs\icon.ico --add-data "static;static" --collect-all comtypes monitor.py
 ```
+
+`--add-data "static;static"` bundles the map library inside the executable; at runtime HamLink reads bundled files from the PyInstaller extraction folder and keeps `config.json`, the message log, and the `tiles/` folder next to the `.exe`.
 
 The executable will be created at `dist\HamLink_Radio.exe`.
 
 ### Distribution
 
 To distribute HamLink Radio to another computer:
-1. Copy `HamLink_Radio.exe` to the target machine
+1. Copy `HamLink_Radio.exe` to the target machine (add a `tiles\` folder next to it for offline maps)
 2. Run it — a `config.json` will be created on first launch
 3. Configure Settings through the web interface
 4. VarAC and other external programs must still be installed separately

@@ -1,5 +1,6 @@
 # Sensitive — contains API keys, passcodes, callsign config
 config.json
+config.json.tmp
 
 # Personal data
 message_log.csv
@@ -7,16 +8,17 @@ message_log.csv
 .last_position.json
 
 # Build artifacts
-HomeLink_Radio.zip
 __pycache__/
 *.pyc
 dist/
 build/
 *.spec
+*.zip
 
 # Offline map tiles (large files, user-downloaded)
 tiles/*.mbtiles
 
-# Claude Code workspace
+# Editor / tooling
 .claude/
-*.zip
+.vscode/
+.idea/

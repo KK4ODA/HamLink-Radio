@@ -1,5 +1,11 @@
 name: Release
 
+# Pushing a tag like v0.2.0 creates a GitHub release with:
+#   1. HamLink-v0.2.0.zip           — clean source archive (tracked files only)
+#   2. HamLink-Radio-v0.2.0-win64.zip — standalone Windows .exe built with PyInstaller
+# The changelog is generated from commits since the previous tag, grouped by
+# conventional-commit prefix (feat:, fix:, docs:, chore:/refactor:/...).
+
 on:
   push:
     tags:
@@ -10,7 +16,10 @@ permissions:
 
 jobs:
   release:
+    name: Source release
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
     steps:
       - name: Checkout (full history for changelog)
         uses: actions/checkout@v4
@@ -21,13 +30,21 @@ jobs:
         id: ver
         shell: bash
         run: |
-          TAG="${GITHUB_REF_NAME}"           # e.g. v0.1.0
-          VERSION="${TAG#v}"                 # e.g. 0.1.0
+          TAG="${GITHUB_REF_NAME}"           # e.g. v0.2.0
+          VERSION="${TAG#v}"                 # e.g. 0.2.0
           PREV_TAG=$(git tag --sort=-v:refname | grep -v "^${TAG}$" | head -n1 || true)
           echo "tag=$TAG"            >> "$GITHUB_OUTPUT"
           echo "version=$VERSION"    >> "$GITHUB_OUTPUT"
           echo "prev_tag=$PREV_TAG"  >> "$GITHUB_OUTPUT"
           echo "Tag=$TAG Version=$VERSION Prev=$PREV_TAG"
+
+      - name: Check version matches monitor.py
+        shell: bash
+        run: |
+          CODE_VER=$(grep -oP '^__version__ = "\K[^"]+' monitor.py)
+          if [ "$CODE_VER" != "${{ steps.ver.outputs.version }}" ]; then
+            echo "::warning::Tag ${{ steps.ver.outputs.tag }} does not match __version__ = $CODE_VER in monitor.py"
+          fi
 
       - name: Build source zip
         id: zip
@@ -35,7 +52,7 @@ jobs:
         run: |
           TAG="${{ steps.ver.outputs.tag }}"
           NAME="HamLink-${TAG}"
-          # git archive ships only tracked files at the tag — clean, no config.json, no csv
+          # git archive ships only tracked files at the tag — no config.json, no logs
           git archive --format=zip --prefix="${NAME}/" -o "${NAME}.zip" "${TAG}"
           ls -la "${NAME}.zip"
           echo "asset=${NAME}.zip" >> "$GITHUB_OUTPUT"
@@ -54,17 +71,22 @@ jobs:
             HEADER="Changes since [\`${PREV}\`](https://github.com/${GITHUB_REPOSITORY}/releases/tag/${PREV})."
           fi
 
-          # Pull commits as "<short-sha> <subject>"
           LOG=$(git log --no-merges --pretty=format:'%h %s' "$RANGE")
 
-          feats=$(echo "$LOG"  | grep -iE '^[0-9a-f]+ (feat|feature)(\(.+\))?:'     || true)
-          fixes=$(echo "$LOG"  | grep -iE '^[0-9a-f]+ fix(\(.+\))?:'                 || true)
-          docs=$(echo "$LOG"   | grep -iE '^[0-9a-f]+ docs?(\(.+\))?:'               || true)
-          chores=$(echo "$LOG" | grep -iE '^[0-9a-f]+ (chore|refactor|ci|build|perf|test|style)(\(.+\))?:' || true)
-          # "Misc" = everything not matched above
-          misc=$(echo "$LOG"   | grep -ivE '^[0-9a-f]+ (feat|feature|fix|docs?|chore|refactor|ci|build|perf|test|style)(\(.+\))?:' || true)
+          feats=$(echo "$LOG"  | grep -iE '^[0-9a-f]+ (feat|feature)(\(.+\))?!?:'     || true)
+          fixes=$(echo "$LOG"  | grep -iE '^[0-9a-f]+ fix(\(.+\))?!?:'                 || true)
+          docs=$(echo "$LOG"   | grep -iE '^[0-9a-f]+ docs?(\(.+\))?!?:'               || true)
+          chores=$(echo "$LOG" | grep -iE '^[0-9a-f]+ (chore|refactor|ci|build|perf|test|style)(\(.+\))?!?:' || true)
+          misc=$(echo "$LOG"   | grep -ivE '^[0-9a-f]+ (feat|feature|fix|docs?|chore|refactor|ci|build|perf|test|style)(\(.+\))?!?:' || true)
 
           {
+            echo "## Downloads"
+            echo ""
+            echo "| Asset | What it is |"
+            echo "|---|---|"
+            echo "| \`HamLink-Radio-${TAG}-win64.zip\` | Standalone Windows app — no Python needed. Unzip, run \`HamLink_Radio.exe\`. |"
+            echo "| \`HamLink-${TAG}.zip\` | Source — run \`start_hamlink.bat\` (needs Python 3.8+). |"
+            echo ""
             echo "## Changelog"
             echo ""
             echo "$HEADER"
@@ -88,5 +110,49 @@ jobs:
         run: |
           gh release create "${{ steps.ver.outputs.tag }}" \
             "${{ steps.zip.outputs.asset }}" \
-            --title "${{ steps.ver.outputs.tag }}" \
+            --title "HamLink Radio ${{ steps.ver.outputs.tag }}" \
             --notes-file RELEASE_NOTES.md
+
+  build-exe:
+    name: Windows standalone .exe
+    needs: release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Build with PyInstaller
+        run: |
+          python -m PyInstaller --onefile --name HamLink_Radio --noconfirm --clean `
+            --add-data "static;static" `
+            --hidden-import flask --hidden-import aprslib `
+            --hidden-import win32gui --hidden-import win32api --hidden-import win32con `
+            --collect-all comtypes `
+            monitor.py
+          dir dist
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $tag = "${{ needs.release.outputs.tag }}"
+          $name = "HamLink-Radio-$tag-win64"
+          New-Item -ItemType Directory -Force $name | Out-Null
+          Copy-Item dist\HamLink_Radio.exe $name\
+          Copy-Item README.md, MANUAL.md, requirements.txt $name\
+          New-Item -ItemType Directory -Force "$name\tiles" | Out-Null
+          Copy-Item tiles\README.txt "$name\tiles\"
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+          Get-Item "$name.zip"
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ needs.release.outputs.tag }}" "HamLink-Radio-${{ needs.release.outputs.tag }}-win64.zip" --clobber

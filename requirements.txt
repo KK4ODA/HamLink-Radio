@@ -1,0 +1,9 @@
+# HamLink Radio — Python dependencies
+# Install with:  python -m pip install -r requirements.txt
+
+flask>=2.3
+aprslib>=0.7
+
+# Windows-only: VarAC broadcast + relay UI automation (pywin32, comtypes)
+pywin32>=306; sys_platform == "win32"
+comtypes>=1.2; sys_platform == "win32"
