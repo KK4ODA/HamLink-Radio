@@ -16,7 +16,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, request, Response
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 UPDATE_REPO = "KK4ODA/HamLink-Radio"   # GitHub repo checked for new releases
 
 # ---------------------------------------------------------------------------
@@ -3231,13 +3231,17 @@ def _restart_app():
             launch = 'start "HamLink Radio" "start_hamlink.bat" --no-browser'
         else:
             launch = f'start "HamLink Radio" "{sys.executable}" "{os.path.abspath(sys.argv[0])}"'
-        with open(helper, "w", encoding="ascii", errors="replace") as f:
+        with open(helper, "w", encoding="ascii", errors="replace", newline="") as f:
             f.write("@echo off\r\n"
                     "timeout /t 3 /nobreak >nul\r\n"
                     f'cd /d "{APP_DIR}"\r\n'
                     'for %%f in (*.bat.new) do move /y "%%f" "%%~nf" >nul\r\n'
                     f"{launch}\r\n")
-        subprocess.Popen(["cmd.exe", "/c", helper], cwd=APP_DIR, close_fds=True,
+        # Strip PyInstaller's bootloader variables: a child that inherits
+        # _MEIPASS2/_PYI_* would reuse this process's extraction folder, which
+        # is deleted the moment we exit, so the relaunched exe would die.
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("_MEI", "_PYI"))}
+        subprocess.Popen(["cmd.exe", "/c", helper], cwd=APP_DIR, close_fds=True, env=env,
                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
                          | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
         _cleanup()
