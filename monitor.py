@@ -11,12 +11,13 @@ All configuration in the browser Settings panel.
 
 import json, os, sys, sqlite3, time, threading, logging, uuid, csv, atexit, signal
 import socket, subprocess, re, copy, html, string, configparser
-import urllib.request, urllib.parse
+import urllib.request, urllib.parse, urllib.error, zipfile, tempfile, shutil
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, request, Response
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
+UPDATE_REPO = "KK4ODA/HamLink-Radio"   # GitHub repo checked for new releases
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -219,6 +220,7 @@ DEFAULT_CONFIG = {
               "ignore_stations": [], "min_snr": None},
     "map_state": "",
     "web_port": 5000,
+    "updates": {"auto_check": True, "interval_hours": 6, "github_token": ""},
     "alert_sound": "gentle",
     "alert_volume": 0.3,
     "quick_replies": [
@@ -299,6 +301,11 @@ state = {
     "relay_last_attempt": {},       # {relay_callsign: ISO timestamp} for cooldown
     "relay_pending_confirm": None,  # Relay callsign awaiting user confirmation (or None)
     "relay_paths": {},              # {from_callsign: last_relay_station} for reply routing
+    # Self-update state (see "Updates" section)
+    "update": {"available": False, "current": __version__, "latest": None, "url": None,
+               "notes": "", "published": None, "asset_url": None, "asset_api_url": None, "asset_name": None,
+               "checked_at": None, "error": None, "install_kind": None,
+               "stage": "idle", "progress": ""},
 }
 slock = threading.Lock()
 
@@ -2958,6 +2965,300 @@ def _trim_memory():
         _aprs_seen_msgs = set(trimmed)
 
 # ---------------------------------------------------------------------------
+# Updates — check GitHub releases, download + install, restart
+# ---------------------------------------------------------------------------
+# Three install kinds are recognised:
+#   exe    — running as the PyInstaller build. The new HamLink_Radio.exe is
+#            downloaded from the release's -win64.zip; the running exe is
+#            renamed to *.old.exe (Windows allows renaming a running binary)
+#            and the new one moved into place. The .old.exe is removed on the
+#            next start.
+#   source — running monitor.py from an unpacked source zip. Every file in the
+#            release's source archive is written over APP_DIR (monitor.py is
+#            backed up to monitor.py.bak first). Batch files are written as
+#            *.bat.new and swapped in by the restart helper, because cmd.exe
+#            reads a running .bat incrementally and must not see it change.
+#   git    — APP_DIR is a git checkout. Self-update is refused; use git pull.
+_update_thread = None
+_update_worker = None
+_update_lock = threading.Lock()
+
+def _parse_version(v):
+    """'v1.2.3-beta' -> (1, 2, 3). Unknown strings compare as (0, 0, 0)."""
+    m = re.match(r"\s*[vV]?(\d+)(?:\.(\d+))?(?:\.(\d+))?", v or "")
+    return tuple(int(x or 0) for x in m.groups()) if m else (0, 0, 0)
+
+def _running_version():
+    # HAMLINK_VERSION_OVERRIDE lets a developer pretend to be an older build
+    # to exercise the update path without editing the code.
+    return os.environ.get("HAMLINK_VERSION_OVERRIDE", "").strip() or __version__
+
+def _install_kind():
+    if getattr(sys, "frozen", False):
+        return "exe"
+    if os.path.isdir(os.path.join(APP_DIR, ".git")):
+        return "git"
+    return "source"
+
+def _set_update(**kv):
+    with slock:
+        state["update"].update(kv)
+
+def _github_token():
+    with cfglock:
+        return (config.get("updates", {}).get("github_token", "") or "").strip()
+
+def _github_headers(accept):
+    """Request headers for api.github.com. A token is only needed while the
+    repository is private (or to lift the anonymous rate limit)."""
+    h = {"User-Agent": f"HamLink-Radio/{__version__}", "Accept": accept}
+    tok = _github_token()
+    if tok:
+        h["Authorization"] = f"Bearer {tok}"
+    return h
+
+def check_for_update(force=False):
+    """Query the GitHub Releases API and record the result in state['update'].
+    Returns the new update dict. Network errors are recorded, never raised."""
+    with cfglock:
+        auto = bool(config.get("updates", {}).get("auto_check", True))
+    if not force and not auto:
+        return
+    now_iso = datetime.now(timezone.utc).isoformat()
+    if DEMO_MODE:
+        return
+    if not _check_internet(timeout=3):
+        _set_update(error="No internet connection", checked_at=now_iso)
+        return
+    try:
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest",
+            headers=_github_headers("application/vnd.github+json"))
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        msg = f"Update check failed: HTTP {e.code}"
+        if e.code == 404:
+            msg += " — the repository or its releases are not visible (private repo? add a GitHub token in Settings → Updates)"
+        elif e.code in (401, 403):
+            msg += " — GitHub token rejected or rate limit hit"
+        log.warning(msg)
+        _set_update(error=msg, checked_at=now_iso)
+        return
+    except Exception as e:
+        log.warning("Update check failed: %s", e)
+        _set_update(error=f"Update check failed: {e}", checked_at=now_iso)
+        return
+    tag = (data.get("tag_name") or "").strip()
+    kind = _install_kind()
+    # Each asset: browser_download_url works for public repos; the API `url`
+    # (with Accept: application/octet-stream + token) works for private ones.
+    assets = {a.get("name", ""): a for a in data.get("assets", [])}
+    asset_name = asset_url = asset_api_url = None
+    if kind == "exe":
+        for name, a in assets.items():
+            if name.lower().endswith("-win64.zip"):
+                asset_name, asset_url, asset_api_url = name, a.get("browser_download_url"), a.get("url")
+                break
+    else:
+        asset_name = f"HamLink-{tag}.zip"
+        a = assets.get(asset_name)
+        if a:
+            asset_url, asset_api_url = a.get("browser_download_url"), a.get("url")
+        else:
+            asset_url = asset_api_url = data.get("zipball_url")
+    available = _parse_version(tag) > _parse_version(_running_version())
+    _set_update(available=available, current=_running_version(), latest=tag,
+                url=data.get("html_url"), notes=(data.get("body") or "")[:6000],
+                published=data.get("published_at"), asset_url=asset_url,
+                asset_api_url=asset_api_url, asset_name=asset_name,
+                checked_at=now_iso, error=None, install_kind=kind)
+    if available:
+        log.info("Update available: %s (running %s) — %s", tag, _running_version(), data.get("html_url"))
+    else:
+        log.info("Update check: %s is current (latest release %s)", _running_version(), tag or "none")
+    with slock:
+        return dict(state["update"])
+
+def _update_check_loop():
+    """Background thread: check shortly after start, then every interval_hours."""
+    time.sleep(20)
+    while True:
+        try:
+            check_for_update()
+        except Exception as e:
+            log.warning("Update check loop error: %s", e)
+        with cfglock:
+            hours = config.get("updates", {}).get("interval_hours", 6)
+        try:
+            hours = max(1, float(hours))
+        except (TypeError, ValueError):
+            hours = 6
+        deadline = time.time() + hours * 3600
+        while time.time() < deadline:
+            time.sleep(60)
+
+def start_update_checker():
+    global _update_thread
+    if _update_thread and _update_thread.is_alive():
+        return
+    _update_thread = threading.Thread(target=_update_check_loop, daemon=True)
+    _update_thread.start()
+
+def _safe_zip_members(z):
+    """Yield (member, relative_path) for regular files in a release archive,
+    stripping the top-level folder and refusing anything that escapes it."""
+    for m in z.infolist():
+        if m.is_dir():
+            continue
+        parts = m.filename.replace("\\", "/").split("/")
+        rel_parts = parts[1:] if len(parts) > 1 else []
+        if not rel_parts or any(p in ("", ".", "..") for p in rel_parts):
+            continue
+        if rel_parts[0] in (".git", ".github", ".gitignore", ".claude"):
+            continue
+        yield m, "/".join(rel_parts)
+
+def _download(info, dest, label):
+    """Fetch the release asset. With a token, use the API asset URL (works for
+    private repos); otherwise the public browser_download_url."""
+    if _github_token() and info.get("asset_api_url"):
+        req = urllib.request.Request(info["asset_api_url"], headers=_github_headers("application/octet-stream"))
+    else:
+        req = urllib.request.Request(info["asset_url"], headers={"User-Agent": f"HamLink-Radio/{__version__}"})
+    with urllib.request.urlopen(req, timeout=60) as resp, open(dest, "wb") as f:
+        total = int(resp.headers.get("Content-Length") or 0)
+        done = 0
+        while True:
+            chunk = resp.read(1 << 16)
+            if not chunk:
+                break
+            f.write(chunk)
+            done += len(chunk)
+            if total:
+                _set_update(progress=f"Downloading {label}… {done * 100 // total}%")
+            else:
+                _set_update(progress=f"Downloading {label}… {done // 1024} KB")
+
+def _apply_update_worker():
+    with slock:
+        info = dict(state["update"])
+    kind = info.get("install_kind") or _install_kind()
+    try:
+        if DEMO_MODE:
+            for pct in (0, 25, 50, 75, 100):
+                _set_update(stage="downloading", progress=f"Downloading (demo)… {pct}%")
+                time.sleep(0.6)
+            _set_update(stage="installing", progress="Installing (demo)…")
+            time.sleep(1)
+            _set_update(stage="done", progress="Demo mode: nothing was installed.")
+            return
+        if kind == "git":
+            raise RuntimeError("This copy is a git checkout — run `git pull` instead.")
+        if not (info.get("asset_url") or info.get("asset_api_url")):
+            raise RuntimeError("The release has no downloadable asset for this install type.")
+        tmpdir = tempfile.mkdtemp(prefix="hamlink-update-")
+        zpath = os.path.join(tmpdir, "update.zip")
+        _set_update(stage="downloading", progress=f"Downloading {info.get('asset_name')}…")
+        _download(info, zpath, info.get("latest") or "update")
+        _set_update(stage="installing", progress="Installing…")
+        new_exe = None
+        with zipfile.ZipFile(zpath) as z:
+            for m, rel in _safe_zip_members(z):
+                if kind == "exe":
+                    if rel.lower().endswith(".exe"):
+                        new_exe = os.path.join(tmpdir, os.path.basename(rel))
+                        with z.open(m) as src, open(new_exe, "wb") as dst:
+                            shutil.copyfileobj(src, dst)
+                        continue
+                    # The win64 zip carries README/MANUAL/tiles README next to the exe
+                    if rel.startswith("tiles/") and rel != "tiles/README.txt":
+                        continue
+                dest = os.path.join(APP_DIR, *rel.split("/"))
+                if rel.lower().endswith(".bat"):
+                    dest += ".new"          # swapped in by the restart helper
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                if rel == "monitor.py" and os.path.isfile(dest):
+                    shutil.copy2(dest, dest + ".bak")
+                with z.open(m) as src, open(dest, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+        if kind == "exe":
+            if not new_exe:
+                raise RuntimeError("No .exe found inside the downloaded archive.")
+            exe = os.path.abspath(sys.executable)
+            old = os.path.splitext(exe)[0] + ".old.exe"
+            if os.path.exists(old):
+                os.remove(old)
+            os.replace(exe, old)        # renaming a running exe is allowed on Windows
+            shutil.move(new_exe, exe)
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        log.info("Update to %s installed (%s) — restarting", info.get("latest"), kind)
+        _set_update(stage="restarting", progress="Installed. Restarting HamLink…", available=False,
+                    current=info.get("latest") or _running_version())
+        time.sleep(1.5)
+        _restart_app()
+    except Exception as e:
+        log.error("Update failed: %s", e)
+        _set_update(stage="error", progress=f"Update failed: {e}")
+
+def apply_update():
+    """Start the download/install worker. Returns (ok, message)."""
+    global _update_worker
+    with _update_lock:
+        if _update_worker and _update_worker.is_alive():
+            return False, "An update is already in progress"
+        with slock:
+            info = dict(state["update"])
+        if not info.get("available") and not DEMO_MODE:
+            return False, "No update available"
+        _set_update(stage="downloading", progress="Starting…")
+        _update_worker = threading.Thread(target=_apply_update_worker, daemon=True)
+        _update_worker.start()
+        return True, ""
+
+def _restart_app():
+    """Relaunch HamLink after an update. On Windows a tiny helper batch waits
+    for this process to exit, swaps in any *.bat.new files, then starts the
+    launcher (source) or the exe. Exit code 0 lets an old launcher window
+    close quietly."""
+    if sys.platform == "win32":
+        helper_dir = tempfile.mkdtemp(prefix="hamlink-restart-")
+        helper = os.path.join(helper_dir, "restart.bat")
+        if getattr(sys, "frozen", False):
+            launch = f'start "" "{os.path.abspath(sys.executable)}"'
+        elif os.path.isfile(os.path.join(APP_DIR, "start_hamlink.bat")) or \
+                os.path.isfile(os.path.join(APP_DIR, "start_hamlink.bat.new")):
+            launch = 'start "HamLink Radio" "start_hamlink.bat" --no-browser'
+        else:
+            launch = f'start "HamLink Radio" "{sys.executable}" "{os.path.abspath(sys.argv[0])}"'
+        with open(helper, "w", encoding="ascii", errors="replace") as f:
+            f.write("@echo off\r\n"
+                    "timeout /t 3 /nobreak >nul\r\n"
+                    f'cd /d "{APP_DIR}"\r\n'
+                    'for %%f in (*.bat.new) do move /y "%%f" "%%~nf" >nul\r\n'
+                    f"{launch}\r\n")
+        subprocess.Popen(["cmd.exe", "/c", helper], cwd=APP_DIR, close_fds=True,
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                         | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+        _cleanup()
+        os._exit(0)
+    else:
+        _cleanup()
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+def _remove_old_exe():
+    """Delete the *.old.exe left behind by a previous self-update (best effort)."""
+    if not getattr(sys, "frozen", False):
+        return
+    old = os.path.splitext(os.path.abspath(sys.executable))[0] + ".old.exe"
+    if os.path.exists(old):
+        try:
+            os.remove(old)
+            log.info("Removed previous version %s", os.path.basename(old))
+        except OSError:
+            pass
+
+# ---------------------------------------------------------------------------
 # Graceful shutdown
 # ---------------------------------------------------------------------------
 _shutdown_done = False
@@ -3155,9 +3456,29 @@ def api_status():
             "internet_up": state["internet_up"],
             "config": cfg_snap,
             "csrf_token": _csrf_token,
-            "version": __version__,
+            "version": _running_version(),
             "demo": DEMO_MODE,
+            "update": dict(state["update"]),
         })
+
+@app.route("/api/update/status")
+def api_update_status():
+    with slock:
+        return jsonify({"ok": True, "update": dict(state["update"])})
+
+@app.route("/api/update/check", methods=["POST"])
+def api_update_check():
+    """Check GitHub for a newer release right now."""
+    check_for_update(force=True)
+    with slock:
+        u = dict(state["update"])
+    return jsonify({"ok": not u.get("error"), "error": u.get("error"), "update": u})
+
+@app.route("/api/update/apply", methods=["POST"])
+def api_update_apply():
+    """Download and install the latest release, then restart."""
+    ok, err = apply_update()
+    return jsonify({"ok": ok, "error": err})
 
 @app.route("/api/acknowledge", methods=["POST"])
 def api_ack():
@@ -3719,6 +4040,10 @@ def api_set_config():
                         "cooldown_seconds", "route_replies_via_relay", "ignore_stations", "min_snr"]:
                 if rk in d["relay"]:
                     config["relay"][rk] = d["relay"][rk]
+        if "updates" in d:
+            for uk in ["auto_check", "interval_hours", "github_token"]:
+                if uk in d["updates"]:
+                    config["updates"][uk] = d["updates"][uk]
         save_config(config)
         new_db = config.get("varac_db_path", "")
     if new_db != old_db and new_db and os.path.isfile(new_db):
@@ -4559,8 +4884,21 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
 .map-info{margin-top:12px;padding:14px 16px;display:none}
 .map-tools{display:flex;gap:8px;margin-top:10px}
 
+/* ---------- Update banner ---------- */
+.update-bar{background:var(--accent-soft);border-bottom:1px solid var(--accent)}
+.update-inner{max-width:720px;margin:0 auto;padding:10px 16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:13.5px}
+.update-inner b{color:var(--text)}
+.update-inner .spacer{flex:1}
+.update-notes{white-space:pre-wrap;font-size:13px;line-height:1.5;background:var(--surface2);border:1px solid var(--border);
+  border-radius:var(--radius-sm);padding:12px;max-height:240px;overflow-y:auto;margin:10px 0}
+.progress{height:8px;background:var(--surface3);border-radius:4px;overflow:hidden;margin-top:10px}
+.progress>i{display:block;height:100%;background:var(--accent);width:0;transition:width .3s}
+.progress.indet>i{width:40%;animation:indet 1.2s ease-in-out infinite}
+@keyframes indet{0%{margin-left:-40%}100%{margin-left:100%}}
+
 /* ---------- Footer ---------- */
 .footer{text-align:center;margin-top:36px;color:var(--text3);font-size:11.5px}
+.footer a{color:inherit}
 .footer .btn{margin-bottom:6px}
 
 @media (max-width:520px){
@@ -4688,6 +5026,35 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
   </nav>
 </header>
 
+<!-- ===================== UPDATE BANNER ===================== -->
+<div class="update-bar hidden" id="updateBar">
+  <div class="update-inner">
+    <span>🎉 <b id="updText">A new version of HamLink is available</b></span>
+    <a id="updLink" href="#" target="_blank" rel="noopener">What's new</a>
+    <span class="spacer"></span>
+    <button class="btn xs primary" onclick="openUpdate()">Update now</button>
+    <button class="btn xs ghost" onclick="skipUpdate()">Later</button>
+  </div>
+</div>
+
+<!-- ===================== UPDATE MODAL ===================== -->
+<div class="modal" id="updateModal" role="dialog" aria-modal="true" aria-labelledby="updTitle">
+  <div class="modal-box">
+    <h3 id="updTitle">Update HamLink</h3>
+    <p id="updIntro"></p>
+    <div class="update-notes" id="updNotes"></div>
+    <p id="updHow" style="font-size:13px"></p>
+    <div id="updProgressWrap" class="hidden">
+      <div class="progress" id="updProgress"><i></i></div>
+      <p id="updStatus" style="margin-top:8px;font-weight:600"></p>
+    </div>
+    <div class="modal-actions" id="updActions">
+      <button class="btn primary" id="updGo" onclick="startUpdate()">⬇️ Download &amp; install</button>
+      <button class="btn ghost" onclick="closeUpdate()">Cancel</button>
+    </div>
+  </div>
+</div>
+
 <!-- ===================== MAP TAB ===================== -->
 <div class="main hidden" id="mapTab">
   <div class="empty" id="mapNoConfig">
@@ -4784,7 +5151,7 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
   <div class="footer">
     <button class="btn sm danger" onclick="confirmShutdown()">⏻ Stop HamLink</button>
     <div>Stops the app and closes VarAC, Soundmodem, Pat, and VARA FM.</div>
-    <div style="margin-top:10px">HamLink Radio <span id="verText"></span></div>
+    <div style="margin-top:10px">HamLink Radio <span id="verText"></span> · <a href="#" onclick="checkUpdateNow(true);return false">Check for updates</a></div>
   </div>
 </main>
 
@@ -5004,6 +5371,19 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
             <div class="gw fhint" id="gwList"></div></div>
           <div class="fg"><label class="fl">VARA FM executable path</label><input class="fi" id="cPatVaraExe" placeholder="C:\VARA FM\VARAFM.exe"><div class="fhint">Leave blank if VARA FM is already running.</div></div>
           <div class="fg"><label class="fl">VARA FM modem address</label><input class="fi w-md" id="cPatVaraAddr" placeholder="localhost:8300"></div>
+        </div>
+      </details>
+
+      <details class="sec">
+        <summary>⬆️ Updates <span class="state" id="stUpd">Off</span></summary>
+        <div class="sec-body">
+          <div class="fg"><div class="tgl-row"><label class="fl">Check for new releases automatically</label><div class="tgl" id="cUpdOn" onclick="this.classList.toggle('on')"></div></div>
+            <div class="fhint">Asks GitHub for the latest release shortly after startup and then periodically. Nothing is installed without your confirmation.</div></div>
+          <div class="fg"><label class="fl">Check every (hours)</label><input class="fi w-xs" id="cUpdHours" type="number" min="1" max="168" value="6"></div>
+          <div class="fg"><label class="fl">GitHub token (optional)</label><input class="fi" id="cUpdToken" type="password" placeholder="Only needed while the repository is private" autocomplete="off">
+            <div class="fhint">A fine-grained token with read access to the repository's contents. Leave blank for a public repository.</div></div>
+          <div class="fg"><div class="fhint" id="updInfo"></div></div>
+          <div class="fg"><button class="btn sm" onclick="checkUpdateNow(false)">Check now</button> <button class="btn sm primary hidden" id="updInstallBtn" onclick="closeSett();openUpdate()">Install update</button><div class="tr" id="updTr"></div></div>
         </div>
       </details>
 
@@ -5309,6 +5689,89 @@ function ui(d){
 
   last = d; render();
   if (currentTab === 'map' && _map) updateMapPosition();
+  if (d.update) showUpdateBanner(d.update);
+}
+
+/* ---------- updates ---------- */
+let _updPollTimer = null;
+function _skippedTag(){ try { return localStorage.getItem('hamlink_update_skipped') || ''; } catch(e){ return ''; } }
+function showUpdateBanner(u){
+  const on = !!(u && u.available && u.latest && u.latest !== _skippedTag() && u.stage !== 'restarting');
+  if (on){ $('updText').textContent = 'HamLink ' + u.latest + ' is available (you have v' + (u.current || '?') + ')'; $('updLink').href = u.url || '#'; }
+  show('updateBar', on);
+}
+function skipUpdate(){ const u = last && last.update; if (u && u.latest){ try { localStorage.setItem('hamlink_update_skipped', u.latest); } catch(e){} } show('updateBar', false); }
+function openUpdate(){
+  const u = (last && last.update) || {};
+  $('updTitle').textContent = 'Update to HamLink ' + (u.latest || '');
+  $('updIntro').textContent = 'You are running v' + (u.current || '?') + '.' + (u.published ? ' Released ' + fmtTime(u.published) + '.' : '');
+  $('updNotes').textContent = (u.notes || '').replace(/^#+\s*/gm, '').trim() || 'No release notes.';
+  const how = {
+    exe: 'The new HamLink_Radio.exe will be downloaded and swapped in. Your config.json, message log, and map tiles are kept. HamLink restarts when done.',
+    source: 'monitor.py and the support files will be replaced (the old monitor.py is kept as monitor.py.bak). Your config.json, message log, and map tiles are kept. HamLink restarts when done.',
+    git: 'This copy is a git checkout. Update it with git pull instead of the in-app updater.',
+  };
+  $('updHow').textContent = how[u.install_kind] || how.source;
+  $('updGo').disabled = u.install_kind === 'git' || !u.asset_url;
+  show('updProgressWrap', false); show('updActions', true);
+  $('updateModal').classList.add('open');
+}
+function closeUpdate(){ $('updateModal').classList.remove('open'); if (_updPollTimer){ clearInterval(_updPollTimer); _updPollTimer = null; } }
+async function startUpdate(){
+  $('updGo').disabled = true;
+  try {
+    const r = await cpost('/api/update/apply'); const d = await r.json();
+    if (!d.ok){ toast(d.error || 'Could not start update', true); $('updGo').disabled = false; return; }
+  } catch(e){ toast('Could not start update: ' + e, true); $('updGo').disabled = false; return; }
+  show('updActions', false); show('updProgressWrap', true);
+  $('updProgress').className = 'progress indet'; $('updStatus').textContent = 'Starting…';
+  _updPollTimer = setInterval(pollUpdateProgress, 1000);
+}
+async function pollUpdateProgress(){
+  let u;
+  try { const r = await fetch('/api/update/status'); u = (await r.json()).update; }
+  catch(e){ // server is restarting — wait for it to come back, then reload
+    $('updStatus').textContent = 'HamLink is restarting… waiting for it to come back.';
+    waitForRestart(); return;
+  }
+  const m = /(\d+)%/.exec(u.progress || '');
+  const bar = $('updProgress');
+  if (m){ bar.className = 'progress'; bar.firstElementChild.style.width = m[1] + '%'; } else bar.className = 'progress indet';
+  $('updStatus').textContent = u.progress || u.stage;
+  if (u.stage === 'error'){ clearInterval(_updPollTimer); _updPollTimer = null; bar.className = 'progress'; show('updActions', true); $('updGo').disabled = false; }
+  if (u.stage === 'done'){ clearInterval(_updPollTimer); _updPollTimer = null; bar.className = 'progress'; bar.firstElementChild.style.width = '100%'; show('updActions', true); $('updGo').disabled = true; }
+  if (u.stage === 'restarting'){ clearInterval(_updPollTimer); _updPollTimer = null; setTimeout(waitForRestart, 2500); }
+}
+function waitForRestart(){
+  if (_updPollTimer) return;
+  let tries = 0;
+  _updPollTimer = setInterval(async () => {
+    tries++;
+    try { const r = await fetch('/api/version', {cache: 'no-store'}); const d = await r.json();
+      if (d.ok){ clearInterval(_updPollTimer); _updPollTimer = null; $('updStatus').textContent = 'Back online with v' + d.version + '. Reloading…'; setTimeout(() => location.reload(), 800); } }
+    catch(e){ $('updStatus').textContent = 'Waiting for HamLink to restart… (' + tries * 2 + 's)'; }
+    if (tries > 90){ clearInterval(_updPollTimer); _updPollTimer = null; $('updStatus').textContent = 'HamLink did not come back on its own. Start it again from start_hamlink.bat or HamLink_Radio.exe, then reload this page.'; }
+  }, 2000);
+}
+async function checkUpdateNow(fromFooter){
+  const tr = $('updTr');
+  if (!fromFooter){ tr.className = 'tr ok'; tr.textContent = 'Checking…'; } else toast('Checking for updates…');
+  try {
+    const r = await cpost('/api/update/check'); const d = await r.json(); const u = d.update || {};
+    if (last) last.update = u;
+    if (u.error){ tr.className = 'tr err'; tr.textContent = u.error; if (fromFooter) toast(u.error, true); }
+    else if (u.available){ tr.className = 'tr ok'; tr.textContent = 'Update available: ' + u.latest; try { localStorage.removeItem('hamlink_update_skipped'); } catch(e){} showUpdateBanner(u); if (fromFooter) toast('HamLink ' + u.latest + ' is available'); }
+    else { tr.className = 'tr ok'; tr.textContent = 'You are up to date (v' + u.current + ').'; if (fromFooter) toast('You are up to date (v' + u.current + ')'); }
+    _updateInfoLine(u);
+  } catch(e){ tr.className = 'tr err'; tr.textContent = 'Check failed: ' + e; }
+}
+function _updateInfoLine(u){
+  u = u || {};
+  let s = 'Running v' + (u.current || '?') + (u.install_kind ? ' (' + u.install_kind + ' install)' : '') + '.';
+  if (u.checked_at) s += ' Last checked ' + fmtTime(u.checked_at) + '.';
+  if (u.latest) s += ' Latest release: ' + u.latest + '.';
+  $('updInfo').textContent = s;
+  show('updInstallBtn', !!u.available && u.install_kind !== 'git');
 }
 
 /* ---------- message lists ---------- */
@@ -5568,13 +6031,14 @@ const val = id => $(id).value.trim();
 
 async function openSett(){ await fillForm(); loadPatConfig(); $('settOverlay').classList.add('open'); }
 function closeSett(){ $('settOverlay').classList.remove('open'); $('fb').classList.remove('open'); }
-document.addEventListener('keydown', e => { if (e.key === 'Escape'){ closeSett(); closeSitrep(); cancelNcRfSend(); } });
+document.addEventListener('keydown', e => { if (e.key === 'Escape'){ closeSett(); closeSitrep(); cancelNcRfSend(); if (!_updPollTimer) closeUpdate(); } });
 
 function _stateBadges(c){
   const set = (id, on) => { const el = $(id); el.textContent = on ? 'On' : 'Off'; el.classList.toggle('on', !!on); };
   set('stVarac', !!c.varac_db_path); set('stPo', !!(c.pushover && c.pushover.enabled)); set('stAprs', !!(c.aprs && c.aprs.enabled));
   set('stSm', !!(c.soundmodem && c.soundmodem.enabled)); set('stBcn', !!(c.beacon && c.beacon.enabled));
   set('stRelay', !!(c.relay && c.relay.enabled)); set('stPat', !!(c.pat && c.pat.enabled));
+  set('stUpd', !(c.updates && c.updates.auto_check === false));
 }
 async function fillForm(){
   try { const r = await fetch('/api/status'); const d = await r.json(); cfg = d.config || cfg; } catch(e){}
@@ -5612,6 +6076,9 @@ async function fillForm(){
   $('cPatPoll').value = pt.poll_interval || 30; $('cPatHomeTac').value = pt.home_tactical || ''; $('cPatTravTac').value = pt.traveler_tactical || '';
   setOn('cPatPosReports', pt.position_reports); setOn('cPatRfFallback', pt.rf_fallback); $('cPatRfPoll').value = pt.rf_poll_interval || 10800;
   $('cPatRfGw').value = pt.rf_gateway || ''; $('cPatVaraAddr').value = pt.varafm_addr || 'localhost:8300'; $('cPatVaraExe').value = pt.varafm_exe_path || '';
+  const up = c.updates || {};
+  setOn('cUpdOn', up.auto_check !== false); $('cUpdHours').value = up.interval_hours || 6; $('cUpdToken').value = up.github_token || '';
+  $('updTr').className = 'tr'; _updateInfoLine(last && last.update);
   _stateBadges(c);
 }
 async function saveSett(){
@@ -5635,6 +6102,7 @@ async function saveSett(){
       home_tactical: val('cPatHomeTac').toUpperCase(), traveler_tactical: val('cPatTravTac').toUpperCase(), position_reports: isOn('cPatPosReports'),
       rf_fallback: isOn('cPatRfFallback'), rf_poll_interval: num('cPatRfPoll', 10800), rf_gateway: val('cPatRfGw').toUpperCase(),
       varafm_addr: val('cPatVaraAddr') || 'localhost:8300', varafm_exe_path: val('cPatVaraExe')},
+    updates: {auto_check: isOn('cUpdOn'), interval_hours: num('cUpdHours', 6), github_token: val('cUpdToken')},
   };
   try {
     const r = await cpost('/api/config', p); const d = await r.json();
@@ -5869,6 +6337,13 @@ def _seed_demo_state():
             "status": "confirmed_wait", "last_attempt": None, "attempts": 0, "error": None,
         }
         state["relay_pending_confirm"] = "K1XYZ"
+        state["update"].update({
+            "available": True, "latest": "v9.9.9", "current": _running_version(),
+            "url": f"https://github.com/{UPDATE_REPO}/releases/latest",
+            "notes": "## Demo release\n\nThis banner shows how an available update is announced. "
+                     "Clicking Update now walks through the download and install steps without changing anything.",
+            "checked_at": now.isoformat(), "install_kind": _install_kind(),
+        })
     log.info("DEMO MODE: seeded sample dashboard data (nothing will be transmitted)")
 
 
@@ -5923,7 +6398,7 @@ def _deferred_launches():
 def main():
     _init_log_file()
     port = int(config.get("web_port", 5000))
-    log.info("HamLink Radio v%s starting on port %d", __version__, port)
+    log.info("HamLink Radio v%s (%s install) starting on port %d", _running_version(), _install_kind(), port)
     log.info("Open http://127.0.0.1:%d", port)
 
     # Check if port is already in use (previous instance still running?)
@@ -5932,10 +6407,12 @@ def main():
         log.error("Stop the other instance first, or change web_port in config.json")
         sys.exit(1)
 
+    _remove_old_exe()
     if DEMO_MODE:
         _seed_demo_state()
     else:
         threading.Thread(target=_deferred_launches, daemon=True).start()
+        start_update_checker()
 
     # Start the DB poll loop (lightweight, non-blocking)
     threading.Thread(target=poll_loop, daemon=True).start()

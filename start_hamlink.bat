@@ -11,6 +11,11 @@ echo.
 
 cd /d "%~dp0"
 
+:: "--no-browser" is passed by HamLink's self-updater when it relaunches
+:: itself; the dashboard tab is already open in that case.
+set "OPEN_BROWSER=1"
+if /I "%~1"=="--no-browser" set "OPEN_BROWSER=0"
+
 :: -------------------------------------------
 :: 1. Python
 :: -------------------------------------------
@@ -106,7 +111,7 @@ echo  Press Ctrl+C here, or use "Stop HamLink" in the browser, to quit.
 echo.
 
 :: Open the browser after a short delay (hidden helper window)
-start /min "" cmd /c "timeout /t 3 /nobreak >nul && start http://127.0.0.1:5000 && exit"
+if "%OPEN_BROWSER%"=="1" start /min "" cmd /c "timeout /t 3 /nobreak >nul && start http://127.0.0.1:5000 && exit"
 
 python monitor.py
 set EXIT_CODE=%ERRORLEVEL%

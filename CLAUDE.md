@@ -112,6 +112,15 @@ HamLink Radio is a family emergency communications app for licensed amateur radi
 ### aprs.fi Backfill
 - On startup, `_aprs_fi_backfill()` queries `https://api.aprs.fi/api/get` for all traveler SSIDs and updates the saved position if newer. Requires `config.aprs.aprs_fi_api_key`.
 
+### Self-update (added v0.3.0)
+- `check_for_update()` hits `https://api.github.com/repos/KK4ODA/HamLink-Radio/releases/latest` (unauthenticated, 60 req/h is plenty at one check per `updates.interval_hours`). Result lives in `state["update"]` and is included in `/api/status`; endpoints `/api/update/status`, `/api/update/check` (POST), `/api/update/apply` (POST).
+- `_install_kind()`: `exe` (frozen), `git` (APP_DIR has `.git` → refuse, say `git pull`), else `source`.
+- exe path: downloads the `*-win64.zip` asset, renames the running exe to `*.old.exe` (allowed on Windows), moves the new one in; `_remove_old_exe()` cleans up at next start.
+- source path: downloads `HamLink-vX.Y.Z.zip` (git archive), writes every file over APP_DIR except `.git*`/`.github`/`.claude`; `monitor.py` → backup `.bak`; `*.bat` written as `*.bat.new` because cmd.exe reads a running batch file incrementally.
+- `_restart_app()` writes a temp `restart.bat` (wait 3s → move `*.bat.new` → `start start_hamlink.bat --no-browser` or the exe), runs it with CREATE_NO_WINDOW, calls `_cleanup()`, exits 0 (so an old launcher closes quietly). The launcher accepts `--no-browser`.
+- UI: banner under the header (`showUpdateBanner`), "Later" stores the skipped tag in `localStorage.hamlink_update_skipped`, modal polls `/api/update/status` then `/api/version` until the server is back and reloads.
+- `HAMLINK_VERSION_OVERRIDE=0.1.0` makes a build pretend to be older — the way to test the update flow against a real release. Demo mode fakes an available `v9.9.9` and a no-op install.
+
 ### Misc robustness
 - `save_config()` writes to `config.json.tmp` then `os.replace` (atomic).
 - `log_reply()` ids are `sent-{channel}-{call}-{uuid8}` — a multi-channel send creates several entries in the same second.

@@ -360,7 +360,27 @@ This two-step process prevents both accidental and non-compliant transmissions.
 
 Click "View Log" at the bottom of the main screen to see a complete history of all incoming and outgoing messages in chronological order. The log is saved to `message_log.csv` and survives application restarts.
 
-### 6.6 Stopping HamLink
+### 6.6 Updating HamLink
+
+HamLink checks GitHub for a newer release about 20 seconds after it starts and then every few hours (the interval is set in Settings → Updates, where the check can also be turned off). Nothing is ever installed without your confirmation.
+
+When a new version is found:
+
+1. A blue banner appears at the top of the dashboard: *HamLink vX.Y.Z is available*. **What's new** opens the release notes on GitHub. **Later** hides the banner for that version.
+2. **Update now** opens a confirmation showing the release notes and what will happen for your type of install.
+3. **Download & install** downloads the release asset, installs it, and restarts HamLink. The page shows progress and reloads by itself once HamLink is back (usually within 10–20 seconds).
+
+What is replaced:
+
+| Install type | What the updater does |
+|---|---|
+| Standalone `.exe` | Downloads the new `HamLink_Radio.exe`, renames the running one to `HamLink_Radio.old.exe`, puts the new one in place, and restarts it. The old copy is deleted on the next start. |
+| Source (`start_hamlink.bat`) | Replaces `monitor.py` (keeping the previous one as `monitor.py.bak`), `static/`, the launcher scripts, and the documentation, then relaunches `start_hamlink.bat`. |
+| Git clone | The updater refuses and asks you to run `git pull`. |
+
+Your `config.json`, `message_log.csv`, saved position, and `tiles/` folder are never touched. You can also check manually at any time from the **Check for updates** link in the page footer or Settings → Updates → **Check now**. If HamLink does not come back after an update, start it again with `start_hamlink.bat` or `HamLink_Radio.exe` and reload the page.
+
+### 6.7 Stopping HamLink
 
 To stop HamLink and all associated programs, open Settings and click the **Stop HamLink** button at the bottom. After confirmation, HamLink will:
 - Stop all background threads (APRS listener, KISS monitor, beacon)

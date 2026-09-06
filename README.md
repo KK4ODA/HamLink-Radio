@@ -84,6 +84,16 @@ python monitor.py
 
 Demo mode fills the dashboard with sample messages and a position so you can explore the UI. Nothing is transmitted, no external programs are launched, and no VarAC database is opened.
 
+## Updating
+
+HamLink checks GitHub for a new release shortly after it starts and every few hours after that (Settings → Updates). When one is found, a banner appears at the top of the dashboard:
+
+- **What's new** opens the release notes.
+- **Update now** downloads the matching asset for your install (the `.exe` for the standalone app, the source zip for a source install), installs it, and restarts HamLink. Your `config.json`, message log, and map tiles are kept; a source install keeps the previous `monitor.py` as `monitor.py.bak`.
+- **Later** hides the banner for that version. You can always check manually from the footer link or Settings → Updates → **Check now**.
+
+If you run HamLink from a `git clone`, the in-app updater steps aside and tells you to `git pull`.
+
 ## Requirements
 
 | Component | Needed for |
@@ -137,4 +147,4 @@ Bug reports and feature requests are welcome in [GitHub Issues](https://github.c
 
 ## License
 
-Open source. 73 de KK4ODA.
+[MIT](LICENSE). 73 de KK4ODA.
