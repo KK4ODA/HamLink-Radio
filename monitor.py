@@ -11,12 +11,12 @@ All configuration in the browser Settings panel.
 
 import json, os, sys, sqlite3, time, threading, logging, uuid, csv, atexit, signal
 import socket, subprocess, re, copy, html, string, configparser
-import urllib.request, urllib.parse, urllib.error, zipfile, tempfile, shutil
+import urllib.request, urllib.parse, urllib.error, zipfile, tempfile, shutil, webbrowser
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, request, Response
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 UPDATE_REPO = "KK4ODA/HamLink-Radio"   # GitHub repo checked for new releases
 
 # ---------------------------------------------------------------------------
@@ -3225,7 +3225,7 @@ def _restart_app():
         helper_dir = tempfile.mkdtemp(prefix="hamlink-restart-")
         helper = os.path.join(helper_dir, "restart.bat")
         if getattr(sys, "frozen", False):
-            launch = f'start "" "{os.path.abspath(sys.executable)}"'
+            launch = f'start "" "{os.path.abspath(sys.executable)}" --no-browser'
         elif os.path.isfile(os.path.join(APP_DIR, "start_hamlink.bat")) or \
                 os.path.isfile(os.path.join(APP_DIR, "start_hamlink.bat.new")):
             launch = 'start "HamLink Radio" "start_hamlink.bat" --no-browser'
@@ -6426,6 +6426,17 @@ def main():
     import flask.cli
     flask.cli.show_server_banner = lambda *_: None
     log.info("Web server ready on port %d", port)
+    # The .bat launcher opens the browser itself; the standalone exe has to do
+    # it here. --no-browser (used by the self-updater's relaunch) suppresses it.
+    if getattr(sys, "frozen", False) and "--no-browser" not in sys.argv and not DEMO_MODE:
+        def _open_browser():
+            time.sleep(2)
+            log.info("Opening http://127.0.0.1:%d in your browser", port)
+            try:
+                webbrowser.open(f"http://127.0.0.1:{port}")
+            except Exception as e:
+                log.warning("Could not open browser: %s", e)
+        threading.Thread(target=_open_browser, daemon=True).start()
     try:
         app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False, threaded=True)
     except OSError as e:
