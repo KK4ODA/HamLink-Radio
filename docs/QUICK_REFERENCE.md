@@ -5,7 +5,7 @@ Two people, three ways to reach each other. Keep this near the radio and on the 
 | | Home station (Brecken) | Traveler (Facundo) |
 |---|---|---|
 | Station callsign | `KK4ODA` | `KK4ODA/P` (VarAC), `KK4ODA` (Winlink) |
-| APRS address | `KK4ODA-5` | `KK4ODA-9` (add `-7` in Settings → APRS if the handheld is used too) |
+| APRS address | `KK4ODA-5` | `KK4ODA-9` (mobile) or `KK4ODA-7` (handheld) |
 | Winlink address | `BRECKEN` | `FACUNDO` |
 | Winlink RF gateway (no internet) | `WD5EMA-10` via VARA FM | any nearby gateway |
 | Home location | 33.8404, -84.2743 (Atlanta area) | shown on the dashboard when you beacon |
@@ -23,7 +23,7 @@ Pick the first channel that works, top to bottom:
 
 **Check in by APRS** (phone app or APRS radio)
 - Send a message **to `KK4ODA-5`**. Keep it under **67 characters**.
-- Send **from `KK4ODA-9`** (the mobile). `KK4ODA-7` only works if it is added to *Traveler APRS SSIDs* in Settings.
+- Send **from `KK4ODA-9`** (mobile) or **`KK4ODA-7`** (handheld); home listens for both.
 - Beacon your position now and then; home sees it on the dashboard and map.
 - You get an ACK back when HamLink receives it. If not, try again or use another channel.
 - No signal? Send anyway. Some iGates and the APRS MAIL bot will hold it.
@@ -41,7 +41,7 @@ Pick the first channel that works, top to bottom:
 - Hear a broadcast like `SITREP#005 on BBS QSY 13:30Z 14.105 pls connect & relay`? That's home. Connect and read it, or ask another ham to relay.
 
 **Getting replies**
-- APRS: replies arrive as messages to `KK4ODA-9`. Retrieve missed ones from the MAIL bot by sending `APRSM` to `MAIL`.
+- APRS: replies go to whichever of `KK4ODA-9` / `KK4ODA-7` last sent a message. Retrieve missed ones from the MAIL bot by sending `APRSM` to `MAIL`.
 - Winlink: sync your inbox; look for mail from `BRECKEN`.
 - VarAC: connect to `KK4ODA` again; queued replies are delivered on connect.
 
@@ -60,7 +60,7 @@ Pick the first channel that works, top to bottom:
 
 **Replying** (tap Reply, or Send Message)
 - Tick the channels to use. Ticking all of them is fine; the message goes out on each.
-- **APRS** goes to `KK4ODA-9` over the internet. Keep it under 67 characters.
+- **APRS** goes to `KK4ODA-9` or `KK4ODA-7` (whichever Facundo last used) over the internet. Keep it under 67 characters.
 - **Winlink** goes to `FACUNDO` over the internet.
 - **VarAC** is queued in the outbox and delivered when Facundo next connects. Always safe to use.
 - Quick-reply buttons send a pre-written message in one tap.
@@ -118,9 +118,9 @@ Everything below lives in `config.json` next to `HamLink_Radio.exe` (the path is
 
 | Setting | Value | Why |
 |---|---|---|
-| Enable APRS-IS | **off** | Turn on to receive/send APRS over the internet. RF APRS via Soundmodem works regardless |
+| Enable APRS-IS | on | Receives and sends APRS over the internet; RF APRS via Soundmodem is the fallback |
 | Home station SSID | `-5` | → home APRS address `KK4ODA-5` |
-| Traveler SSID(s) | `-9` | → traveler address `KK4ODA-9` (add `, -7` for the handheld) |
+| Traveler SSID(s) | `-9, -7` | → traveler addresses `KK4ODA-9` (mobile) and `KK4ODA-7` (handheld) |
 | Server / port | `rotate.aprs2.net` / `14580` | |
 | Passcode | set (Auto-generate recreates it) | |
 | RF fallback | on | Send via Soundmodem when internet is down (licensed-operator confirmation) |
