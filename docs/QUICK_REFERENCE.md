@@ -1,12 +1,14 @@
 # HamLink Radio — Quick Reference
 
-Two people, three ways to reach each other. Fill in the blanks once and keep this near the radio and on the fridge.
+Two people, three ways to reach each other. Keep this near the radio and on the fridge.
 
-| | Home station | Traveler |
+| | Home station (Brecken) | Traveler (Facundo) |
 |---|---|---|
-| Callsign | `HOMECALL` (VarAC / Winlink) | `HOMECALL/P` (VarAC), `HOMECALL-7` (APRS) |
-| APRS address | `HOMECALL-5` | `HOMECALL-7` |
-| Winlink address | `HOMEBASE` (tactical) | `TRAVELER` (tactical) |
+| Station callsign | `KK4ODA` | `KK4ODA/P` (VarAC), `KK4ODA` (Winlink) |
+| APRS address | `KK4ODA-5` | `KK4ODA-9` (primary), `KK4ODA-7` (backup) |
+| Winlink address | `BRECKEN` | `FACUNDO` |
+| Winlink RF gateway (no internet) | `WD5EMA-10` via VARA FM | any nearby gateway |
+| Home location | 33.8404, -84.2743 (Atlanta area) | shown on the dashboard when you beacon |
 | VarAC frequency / schedule | see VarAC frequency schedule | same |
 
 Pick the first channel that works, top to bottom:
@@ -17,30 +19,31 @@ Pick the first channel that works, top to bottom:
 
 ---
 
-## For the traveler (on the road)
+## For Facundo (on the road)
 
 **Check in by APRS** (phone app or APRS radio)
-- Send a message **to `HOMECALL-5`**. Keep it under **67 characters**.
+- Send a message **to `KK4ODA-5`**. Keep it under **67 characters**.
+- Send **from `KK4ODA-9`** (or `KK4ODA-7`); home listens for both.
 - Beacon your position now and then; home sees it on the dashboard and map.
 - You get an ACK back when HamLink receives it. If not, try again or use another channel.
 - No signal? Send anyway. Some iGates and the APRS MAIL bot will hold it.
 
 **Check in by Winlink** (Pat, Winlink Express, or the Winlink web/phone app)
-- Send **to `HOMEBASE`** (the home tactical address, not `HOMECALL`).
-- Send **from `TRAVELER`**, your tactical address. Winlink refuses mail from a callsign to itself.
+- Send **to `BRECKEN`** (the home tactical address, not `KK4ODA`).
+- Send **from `FACUNDO`**, your tactical address. Winlink refuses mail from a callsign to itself.
 - Optional: post a Winlink position report. Home sees it.
-- Home checks Winlink every few minutes; over RF gateway, every few hours.
+- Home checks Winlink every few minutes; over the RF gateway, every few hours.
 
 **Check in by VarAC**
-- Connect to **`HOMECALL`** and send a VMail. Sign as `HOMECALL/P`.
-- Can't reach home directly? Send the VMail to any relay station. Home is alerted that a relay is holding it.
+- Connect to **`KK4ODA`** and send a VMail. Sign as `KK4ODA/P`.
+- Can't reach home directly? Send the VMail to any relay station. Home is alerted that a relay is holding it and can fetch it.
 - Read the **BBS** on the home station: the newest `$$SITREP_nnn` file is the family status report.
 - Hear a broadcast like `SITREP#005 on BBS QSY 13:30Z 14.105 pls connect & relay`? That's home. Connect and read it, or ask another ham to relay.
 
 **Getting replies**
-- APRS: replies arrive as messages to `HOMECALL-7`. Retrieve missed ones from the MAIL bot with `APRSM` sent to `MAIL`.
-- Winlink: sync your inbox; look for mail from `HOMEBASE`.
-- VarAC: connect to `HOMECALL` again; queued replies are delivered on connect.
+- APRS: replies arrive as messages to `KK4ODA-9`. Retrieve missed ones from the MAIL bot by sending `APRSM` to `MAIL`.
+- Winlink: sync your inbox; look for mail from `BRECKEN`.
+- VarAC: connect to `KK4ODA` again; queued replies are delivered on connect.
 
 **Message tips**
 - Lead with the essentials: *where you are, that you're OK, next check-in time*.
@@ -48,36 +51,37 @@ Pick the first channel that works, top to bottom:
 
 ---
 
-## For the person at home
+## For Brecken (at home)
 
 **When a message arrives**
-- The dashboard turns red, the PC beeps, your phone gets a Pushover alert.
+- The dashboard turns red, the PC beeps, your phone gets a Pushover alert (if enabled).
 - **Dismiss alert** silences the sound. **Close** files the message. **Reply** answers it.
-- Green banner "checked in" = all quiet. Check the position card to see where they were last heard.
+- Green banner "checked in" = all quiet. The position card shows where Facundo was last heard; the Offline Map tab shows it on a map.
 
 **Replying** (tap Reply, or Send Message)
 - Tick the channels to use. Ticking all of them is fine; the message goes out on each.
-- **APRS** goes out over the internet. Keep it under 67 characters.
-- **Winlink** goes out over the internet to `TRAVELER`.
-- **VarAC** is queued in the outbox and delivered when the traveler next connects. Always safe to use.
+- **APRS** goes to `KK4ODA-9` over the internet. Keep it under 67 characters.
+- **Winlink** goes to `FACUNDO` over the internet.
+- **VarAC** is queued in the outbox and delivered when Facundo next connects. Always safe to use.
 - Quick-reply buttons send a pre-written message in one tap.
 
 **If the internet is down**
-- APRS and Winlink can fall back to radio (Soundmodem, VARA FM). You will see an amber "RF" label and a warning.
+- APRS can go out by radio through Soundmodem, and Winlink through the `WD5EMA-10` gateway with VARA FM. You will see an amber "RF" label and a warning.
 - Only proceed if a licensed operator is present, or it is a genuine emergency involving safety of life or property.
 - VarAC keeps working without internet.
 
 **Post a family status report (Sitrep)**
 - Tap **Post Sitrep to BBS**. Change only what's different; **Quick All-OK** sends an all-clear in one tap.
-- HamLink saves it to the VarAC BBS and announces it on the air so the traveler, or any ham nearby, can pick it up.
+- HamLink saves it to the VarAC BBS and announces it on the air so Facundo, or any ham nearby, can pick it up.
 
 **From your phone**
 - The Pushover alert has a **Dismiss** link, and optional quick-reply links that confirm before sending.
-- Phone must be on the same Wi-Fi as the HamLink PC for the links to work.
+- Your phone must be on the home Wi-Fi for the links to work.
 
 **Relay alerts**
-- "Station K1XYZ is holding a message" means the traveler couldn't reach you directly. Tap **Retrieve now** (or approve auto-retrieval) and VarAC fetches it.
+- "Station XXXX is holding a message" means Facundo couldn't reach you directly. Tap **Retrieve now** (or approve auto-retrieval) and VarAC fetches it.
 
 **Keep it running**
 - Leave the HamLink window and browser tab open. Tap Start Monitoring after a reboot so alert sounds work.
+- Settings live in `config.json` next to `HamLink_Radio.exe` (the path is shown at the bottom of the page and in Settings).
 - Stop HamLink only from the button at the bottom of the page.

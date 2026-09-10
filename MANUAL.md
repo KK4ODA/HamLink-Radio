@@ -257,13 +257,17 @@ When internet is down, Pushover notifications and Winlink position report querie
 
 ### 5.9 Offline Map
 
-Select a US state to enable offline map viewing on the Map tab. The app serves tiles from a local MBTiles file, so the map works without internet.
+HamLink downloads its own map tiles, so the Offline Map tab works with no internet once the download is done. Tiles come from the **USGS National Map** (United States public domain) and are stored as a standard `.mbtiles` file in the `tiles/` folder next to `config.json`.
 
 | Field | Description |
 |-------|-------------|
-| **State** | Select your state. The app looks for a matching `.mbtiles` file (e.g., `georgia.mbtiles`) in the `tiles/` folder. |
+| **Center** | Latitude / longitude of the middle of the area. **Use home position** copies the coordinates from the Position beacon section. |
+| **Radius** | How far from the center to cover, in km. 150 km covers a typical day's drive; up to 600 km is allowed. |
+| **Detail (max zoom)** | 12 shows roads and neighborhoods and is a good default. 13–14 add street names but multiply the download size. |
+| **Map style** | *USGS Topo* (roads, terrain, place names) or *USGS Imagery + Topo* (satellite with labels). |
+| **Name** | File name for the map (`tiles/<name>.mbtiles`). |
 
-Download tiles using [MOBAC (Mobile Atlas Creator)](https://mobac.sourceforge.io/). Select OpenStreetMap as the source, your state area, zoom levels 6-13, and export as MBTiles. See `tiles/README.txt` for details.
+The size estimate updates as you change the radius and zoom. Press **Download map**; progress is shown and HamLink keeps working meanwhile. When it finishes, the new map is selected automatically. **Maps on this computer** lists every `.mbtiles` in `tiles/` with **Use** and **Delete** buttons — you can also drop a file made with another tool (MOBAC, QGIS, etc.) into that folder and select it there. Keep total size reasonable: a 150 km radius at zoom 12 is about 2,000 tiles / 45 MB.
 
 ### 5.10 APRS RF Monitor (Soundmodem)
 

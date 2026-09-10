@@ -16,7 +16,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, request, Response
 
-__version__ = "0.3.2"
+__version__ = "0.4.0"
 UPDATE_REPO = "KK4ODA/HamLink-Radio"   # GitHub repo checked for new releases
 
 # ---------------------------------------------------------------------------
@@ -218,7 +218,8 @@ DEFAULT_CONFIG = {
               "max_retries": 2, "retry_delay_seconds": 120,
               "cooldown_seconds": 300, "route_replies_via_relay": True,
               "ignore_stations": [], "min_snr": None},
-    "map_state": "",
+    "map_state": "",      # legacy: US state name -> tiles/<state>.mbtiles
+    "map_file": "",       # preferred: file name inside tiles/
     "web_port": 5000,
     "updates": {"auto_check": True, "interval_hours": 6, "github_token": ""},
     "alert_sound": "gentle",
@@ -3263,6 +3264,367 @@ def _remove_old_exe():
             pass
 
 # ---------------------------------------------------------------------------
+# Offline map tiles — built-in downloader (USGS The National Map)
+# ---------------------------------------------------------------------------
+# Tiles come from the USGS National Map basemaps, which are US-government
+# public domain and permit bulk download for offline use. They are stored in
+# a standard MBTiles file under tiles/ and served by /tiles/{z}/{x}/{y}.png.
+MAP_SOURCES = {
+    "usgs_topo": {
+        "label": "USGS Topo (roads, terrain, place names)",
+        "url": "https://basemap.nationalmap.gov/arcgis/rest/services/USGSTopo/MapServer/tile/{z}/{y}/{x}",
+        "attribution": "USGS The National Map", "max_zoom": 16,
+    },
+    "usgs_imagery": {
+        "label": "USGS Imagery + Topo (satellite with labels)",
+        "url": "https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryTopo/MapServer/tile/{z}/{y}/{x}",
+        "attribution": "USGS The National Map", "max_zoom": 16,
+    },
+}
+TILES_DIR = os.path.join(APP_DIR, "tiles")
+_map_dl = {"running": False, "name": "", "done": 0, "total": 0, "failed": 0,
+           "error": None, "file": None, "cancel": False, "started": None, "finished": None}
+_map_dl_lock = threading.Lock()
+
+def _tile_xy(lat, lon, z):
+    import math
+    lat = max(-85.0511, min(85.0511, lat))
+    n = 2 ** z
+    x = int((lon + 180.0) / 360.0 * n)
+    y = int((1.0 - math.log(math.tan(math.radians(lat)) + 1 / math.cos(math.radians(lat))) / math.pi) / 2.0 * n)
+    return max(0, min(n - 1, x)), max(0, min(n - 1, y))
+
+def _map_bbox(lat, lon, radius_km):
+    import math
+    dlat = radius_km / 111.0
+    dlon = radius_km / (111.0 * max(0.1, math.cos(math.radians(lat))))
+    return lat - dlat, lon - dlon, lat + dlat, lon + dlon   # south, west, north, east
+
+def _map_tile_list(lat, lon, radius_km, zmin, zmax):
+    s, w, n, e = _map_bbox(lat, lon, radius_km)
+    tiles = []
+    for z in range(zmin, zmax + 1):
+        x0, y0 = _tile_xy(n, w, z)   # top-left
+        x1, y1 = _tile_xy(s, e, z)   # bottom-right
+        for x in range(x0, x1 + 1):
+            for y in range(y0, y1 + 1):
+                tiles.append((z, x, y))
+    return tiles, (s, w, n, e)
+
+def map_estimate(lat, lon, radius_km, zmin, zmax):
+    tiles, _ = _map_tile_list(lat, lon, radius_km, zmin, zmax)
+    return {"tiles": len(tiles), "mb": round(len(tiles) * 22 / 1024, 1)}  # ~22 KB per USGS tile
+
+def _safe_map_name(name):
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "-", (name or "").strip()).strip("-.")
+    return name[:60] or "map"
+
+def list_maps():
+    """MBTiles files in tiles/ with size and any stored metadata."""
+    out = []
+    if not os.path.isdir(TILES_DIR):
+        return out
+    for f in sorted(os.listdir(TILES_DIR)):
+        if not f.lower().endswith(".mbtiles"):
+            continue
+        p = os.path.join(TILES_DIR, f)
+        meta = {}
+        try:
+            c = sqlite3.connect(p)
+            meta = dict(c.execute("SELECT name, value FROM metadata").fetchall())
+            c.close()
+        except Exception:
+            pass
+        out.append({"file": f, "size_mb": round(os.path.getsize(p) / 1048576, 1),
+                    "name": meta.get("name", f), "bounds": meta.get("bounds"),
+                    "minzoom": meta.get("minzoom"), "maxzoom": meta.get("maxzoom"),
+                    "attribution": meta.get("attribution", "")})
+    return out
+
+def _active_map_path():
+    """tiles/<map_file>, or the legacy <state>.mbtiles, or None."""
+    with cfglock:
+        mf = (config.get("map_file") or "").strip()
+        st = (config.get("map_state") or "").strip()
+    if mf:
+        p = os.path.join(TILES_DIR, os.path.basename(mf))
+        if os.path.isfile(p):
+            return p
+    if st:
+        p = os.path.join(TILES_DIR, st.lower().replace(" ", "-") + ".mbtiles")
+        if os.path.isfile(p):
+            return p
+    return None
+
+def _map_download_worker(name, lat, lon, radius_km, zmin, zmax, source):
+    src = MAP_SOURCES[source]
+    tiles, (s, w, n, e) = _map_tile_list(lat, lon, radius_km, zmin, zmax)
+    os.makedirs(TILES_DIR, exist_ok=True)
+    final = os.path.join(TILES_DIR, name + ".mbtiles")
+    part = final + ".part"
+    with _map_dl_lock:
+        _map_dl.update(running=True, name=name, done=0, total=len(tiles), failed=0, error=None,
+                       file=None, cancel=False, started=datetime.now(timezone.utc).isoformat(), finished=None)
+    log.info("Map download: %s — %d tiles, z%d-%d, %.0f km around %.4f,%.4f (%s)",
+             name, len(tiles), zmin, zmax, radius_km, lat, lon, source)
+    conn = None
+    try:
+        if os.path.exists(part):
+            os.remove(part)
+        conn = sqlite3.connect(part, check_same_thread=False)
+        conn.executescript("""
+            CREATE TABLE metadata (name TEXT, value TEXT);
+            CREATE TABLE tiles (zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER, tile_data BLOB);
+            CREATE UNIQUE INDEX tile_index ON tiles (zoom_level, tile_column, tile_row);
+        """)
+        conn.executemany("INSERT INTO metadata VALUES (?, ?)", [
+            ("name", name), ("format", "jpg"), ("type", "baselayer"), ("version", "1"),
+            ("description", f"HamLink offline map, {radius_km:.0f} km around {lat:.4f},{lon:.4f}"),
+            ("bounds", f"{w:.5f},{s:.5f},{e:.5f},{n:.5f}"), ("center", f"{lon:.5f},{lat:.5f},{zmin}"),
+            ("minzoom", str(zmin)), ("maxzoom", str(zmax)), ("attribution", src["attribution"]),
+        ])
+        conn.commit()
+        import concurrent.futures
+        db_lock = threading.Lock()
+        headers = {"User-Agent": f"HamLink-Radio/{__version__} (offline map cache)"}
+
+        def fetch(t):
+            z, x, y = t
+            if _map_dl["cancel"]:
+                return None
+            url = src["url"].format(z=z, x=x, y=y)
+            for attempt in range(3):
+                try:
+                    req = urllib.request.Request(url, headers=headers)
+                    with urllib.request.urlopen(req, timeout=20) as r:
+                        data = r.read()
+                    if data:
+                        with db_lock:
+                            conn.execute("INSERT OR REPLACE INTO tiles VALUES (?, ?, ?, ?)",
+                                         (z, x, (2 ** z - 1) - y, sqlite3.Binary(data)))
+                    return True
+                except urllib.error.HTTPError as ex:
+                    if ex.code == 404:
+                        return True   # no tile there (ocean / outside coverage) — not a failure
+                    time.sleep(0.5 * (attempt + 1))
+                except Exception:
+                    time.sleep(0.5 * (attempt + 1))
+            return False
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            for i, ok in enumerate(pool.map(fetch, tiles), 1):
+                with _map_dl_lock:
+                    _map_dl["done"] = i
+                    if ok is False:
+                        _map_dl["failed"] += 1
+                if i % 200 == 0:
+                    with db_lock:
+                        conn.commit()
+                if _map_dl["cancel"]:
+                    break
+        with db_lock:
+            conn.commit()
+        conn.close()
+        conn = None
+        if _map_dl["cancel"]:
+            os.remove(part)
+            with _map_dl_lock:
+                _map_dl.update(running=False, error="Cancelled", finished=datetime.now(timezone.utc).isoformat())
+            log.info("Map download cancelled")
+            return
+        if os.path.exists(final):
+            os.remove(final)
+        os.replace(part, final)
+        with cfglock:
+            config["map_file"] = name + ".mbtiles"
+            save_config(config)
+        with _map_dl_lock:
+            _map_dl.update(running=False, file=name + ".mbtiles", finished=datetime.now(timezone.utc).isoformat())
+        log.info("Map download complete: %s (%d tiles, %d failed)", final, len(tiles), _map_dl["failed"])
+    except Exception as ex:
+        log.error("Map download failed: %s", ex)
+        try:
+            if conn:
+                conn.close()
+            if os.path.exists(part):
+                os.remove(part)
+        except Exception:
+            pass
+        with _map_dl_lock:
+            _map_dl.update(running=False, error=str(ex), finished=datetime.now(timezone.utc).isoformat())
+
+def start_map_download(name, lat, lon, radius_km, zmin, zmax, source):
+    with _map_dl_lock:
+        if _map_dl["running"]:
+            return False, "A map download is already running"
+    if source not in MAP_SOURCES:
+        return False, "Unknown map source"
+    zmin = max(3, min(int(zmin), 16))
+    zmax = max(zmin, min(int(zmax), MAP_SOURCES[source]["max_zoom"]))
+    radius_km = max(5.0, min(float(radius_km), 600.0))
+    est = map_estimate(lat, lon, radius_km, zmin, zmax)
+    if est["tiles"] > 150000:
+        return False, f"That area needs {est['tiles']} tiles — reduce the radius or the max zoom"
+    threading.Thread(target=_map_download_worker, args=(_safe_map_name(name), float(lat), float(lon),
+                     radius_km, zmin, zmax, source), daemon=True).start()
+    return True, ""
+
+# ---------------------------------------------------------------------------
+# Settings tests + validation (the "Test" buttons in Settings)
+# ---------------------------------------------------------------------------
+def _test_tcp(host, port, what):
+    host = (host or "127.0.0.1").strip() or "127.0.0.1"
+    if host in ("localhost",):
+        host = "127.0.0.1"
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return {"ok": False, "message": f"Invalid port for {what}"}
+    if _port_open(host, port, timeout=3):
+        return {"ok": True, "message": f"{what} is listening on {host}:{port}"}
+    return {"ok": False, "message": f"Nothing is listening on {host}:{port} — is {what} running?"}
+
+def _test_aprs_is(server, port, callsign, passcode):
+    """Log in to APRS-IS and read the server's verdict on the passcode."""
+    callsign = (callsign or "").strip().upper()
+    if not callsign:
+        return {"ok": False, "message": "Enter a home callsign first"}
+    pc = (passcode or "").strip() or str(aprs_passcode(callsign))
+    try:
+        with socket.create_connection(((server or "rotate.aprs2.net").strip(), int(port or 14580)), timeout=8) as s:
+            s.settimeout(8)
+            banner = s.recv(512).decode("ascii", "replace").strip()
+            s.sendall(f"user {callsign} pass {pc} vers HamLink-Radio {__version__}\r\n".encode())
+            resp = ""
+            for _ in range(5):
+                chunk = s.recv(512).decode("ascii", "replace")
+                resp += chunk
+                if "logresp" in resp or not chunk:
+                    break
+    except Exception as e:
+        return {"ok": False, "message": f"Could not reach APRS-IS: {e}"}
+    line = next((l for l in resp.splitlines() if "logresp" in l), resp.strip() or banner)
+    if "verified" in line and "unverified" not in line:
+        return {"ok": True, "message": f"Logged in to APRS-IS as {callsign} (passcode verified). {line.strip('# ')}"}
+    if "unverified" in line:
+        return {"ok": False, "message": f"Connected, but the passcode is wrong for {callsign} (server says: {line.strip('# ')}). Use Auto-generate."}
+    return {"ok": False, "message": f"Unexpected reply from APRS-IS: {line.strip() or 'no response'}"}
+
+def _test_aprs_fi(key):
+    key = (key or "").strip()
+    if not key:
+        return {"ok": False, "message": "Enter an aprs.fi API key first"}
+    calls = _aprs_traveler_calls() or ["W1AW"]
+    try:
+        url = "https://api.aprs.fi/api/get?" + urllib.parse.urlencode(
+            {"name": calls[0], "what": "loc", "apikey": key, "format": "json"})
+        req = urllib.request.Request(url, headers={"User-Agent": "HamLink-Radio"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            d = json.loads(r.read().decode())
+    except Exception as e:
+        return {"ok": False, "message": f"aprs.fi request failed: {e}"}
+    if d.get("result") == "ok":
+        n = len(d.get("entries") or [])
+        return {"ok": True, "message": f"aprs.fi key works. {calls[0]}: {n} position record(s) on file."}
+    return {"ok": False, "message": f"aprs.fi says: {d.get('description') or d.get('result')}"}
+
+def _test_pat(http_addr, exe_path):
+    parts = []
+    exe_ok = bool(exe_path) and os.path.isfile(exe_path)
+    parts.append("pat.exe found" if exe_ok else ("pat.exe NOT found at that path" if exe_path else "no pat.exe path set"))
+    addr = (http_addr or "localhost:8080").strip()
+    try:
+        with urllib.request.urlopen(urllib.request.Request(f"http://{addr}/api/mailbox/in"), timeout=5) as r:
+            n = len(json.loads(r.read().decode()) or [])
+        parts.append(f"Pat is running on {addr} ({n} messages in inbox)")
+        ok = True
+    except Exception as e:
+        parts.append(f"Pat is not answering on {addr} ({str(e)[:60]}) — it is launched automatically at startup when the path is set")
+        ok = exe_ok
+    return {"ok": ok, "message": ". ".join(parts)}
+
+def _test_github(token):
+    try:
+        h = {"User-Agent": f"HamLink-Radio/{__version__}", "Accept": "application/vnd.github+json"}
+        if (token or "").strip():
+            h["Authorization"] = f"Bearer {token.strip()}"
+        req = urllib.request.Request(f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest", headers=h)
+        with urllib.request.urlopen(req, timeout=10) as r:
+            d = json.loads(r.read().decode())
+        return {"ok": True, "message": f"GitHub reachable — latest release is {d.get('tag_name')}" + (" (token accepted)" if token else "")}
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return {"ok": False, "message": "GitHub returned 404: the repository is private and this token (or no token) cannot see it"}
+        if e.code in (401, 403):
+            return {"ok": False, "message": f"GitHub rejected the token (HTTP {e.code})"}
+        return {"ok": False, "message": f"GitHub error HTTP {e.code}"}
+    except Exception as e:
+        return {"ok": False, "message": f"Could not reach GitHub: {e}"}
+
+_CALL_RE = re.compile(r"^[A-Z0-9]{1,3}[0-9][A-Z0-9]{0,3}[A-Z](?:-(?:[0-9]|1[0-5]))?$")
+
+def validate_config(c):
+    """Return a list of {level, field, message} for things that look wrong."""
+    w = []
+    def warn(field, msg, level="warn"):
+        w.append({"level": level, "field": field, "message": msg})
+    home = (c.get("home_callsign") or "").strip().upper()
+    if not home:
+        warn("home_callsign", "Home station callsign is empty — replies cannot be sent.", "error")
+    elif "-" in home:
+        warn("home_callsign", f"Home callsign '{home}' includes an SSID. Enter the base callsign only ({home.split('-')[0]}); the APRS SSID is added from the APRS section, and VarAC/Winlink use the base callsign.")
+    watch = [x.strip().upper() for x in c.get("watch_callsigns", []) if x.strip()]
+    if not watch:
+        warn("watch_callsigns", "No watch callsigns — every sender will trigger an alert.", "info")
+    if watch and all("-" in x for x in watch):
+        warn("watch_callsigns", "Watch callsigns are matched exactly against VarAC's 'from' field. VarAC usually shows the traveler as CALL or CALL/P, not CALL-9 — add that form too (e.g. 'KK4ODA, KK4ODA/P').")
+    ap = c.get("aprs", {})
+    if ap.get("enabled") and not home:
+        warn("aprs", "APRS-IS is enabled but no home callsign is set.", "error")
+    ssid = (ap.get("home_ssid") or "").strip()
+    if ssid and not re.match(r"^-(?:[0-9]|1[0-5])$", ssid):
+        warn("aprs.home_ssid", f"Home SSID '{ssid}' should look like -5.")
+    for s in (ap.get("traveler_ssids") or "").split(","):
+        s = s.strip()
+        if s and not re.match(r"^-?(?:[0-9]|1[0-5])$", s):
+            warn("aprs.traveler_ssids", f"Traveler SSID '{s}' should look like -7 or -9.")
+    if ap.get("rf_fallback") and not c.get("soundmodem", {}).get("enabled"):
+        warn("aprs.rf_fallback", "APRS RF fallback is on but the Soundmodem section is disabled — RF fallback will never be used.")
+    pt = c.get("pat", {})
+    if pt.get("enabled"):
+        if not pt.get("exe_path"):
+            warn("pat.exe_path", "Winlink is enabled but the Pat executable path is empty — Pat will not be launched.")
+        elif not os.path.isfile(pt["exe_path"]):
+            warn("pat.exe_path", f"Pat executable not found: {pt['exe_path']}", "error")
+        gw = (pt.get("rf_gateway") or "").strip().upper()
+        if gw and not _CALL_RE.match(gw):
+            warn("pat.rf_gateway", f"VARA FM gateway '{gw}' does not look like a callsign (expected e.g. WD5EMA-10).", "error")
+        if pt.get("rf_fallback") and not gw:
+            warn("pat.rf_fallback", "Winlink RF fallback is on but no VARA FM gateway is set.")
+        if not pt.get("home_tactical") or not pt.get("traveler_tactical"):
+            warn("pat.tactical", "Set both tactical addresses — Winlink refuses mail from a callsign to itself.")
+    sm = c.get("soundmodem", {})
+    if sm.get("enabled") and sm.get("exe_path") and not os.path.isfile(sm["exe_path"]):
+        warn("soundmodem.exe_path", f"Soundmodem executable not found: {sm['exe_path']}", "error")
+    if c.get("varac_exe_path") and not os.path.isfile(c["varac_exe_path"]):
+        warn("varac_exe_path", f"VarAC executable not found: {c['varac_exe_path']}", "error")
+    if c.get("varac_db_path") and not os.path.isfile(c["varac_db_path"]):
+        warn("varac_db_path", f"VarAC database not found: {c['varac_db_path']}", "error")
+    elif not c.get("varac_db_path"):
+        warn("varac_db_path", "No VarAC database path — VarAC messages will not be monitored.", "info")
+    b = c.get("beacon", {})
+    if b.get("enabled") and not (b.get("lat") and b.get("lon")):
+        warn("beacon", "Beacon is enabled but latitude/longitude are not set.", "error")
+    if b.get("enabled") and b.get("via_rf") and not sm.get("enabled"):
+        warn("beacon.via_rf", "RF beacon is on but the Soundmodem section is disabled.")
+    po = c.get("pushover", {})
+    if po.get("enabled") and not (po.get("user_key") and po.get("api_token")):
+        warn("pushover", "Pushover is enabled but the user key or API token is missing.", "error")
+    if c.get("map_file") and not os.path.isfile(os.path.join(TILES_DIR, os.path.basename(c["map_file"]))):
+        warn("map_file", f"Offline map file not found in tiles/: {c['map_file']}")
+    return w
+
+# ---------------------------------------------------------------------------
 # Graceful shutdown
 # ---------------------------------------------------------------------------
 _shutdown_done = False
@@ -3383,12 +3745,9 @@ _EMPTY_TILE = Response(b"", status=204)
 def serve_tile(z, x, y):
     """Serve map tiles from a local MBTiles file."""
     global _mbtiles_conn, _mbtiles_path
-    with cfglock:
-        state_name = config.get("map_state", "")
-    if not state_name:
+    fpath = _active_map_path()
+    if not fpath:
         return Response(b"", status=204)
-    fname = state_name.lower().replace(" ", "-") + ".mbtiles"
-    fpath = os.path.join(APP_DIR, "tiles", fname)
     # MBTiles uses TMS y-coordinate (flipped from XYZ)
     tms_y = (2 ** z - 1) - y
     with _mbtiles_lock:
@@ -3413,10 +3772,158 @@ def serve_tile(z, x, y):
                         (z, x, tms_y))
             row = cur.fetchone()
             if row:
-                return Response(row[0], mimetype="image/png")
+                data = bytes(row[0])
+                mt = "image/png" if data[:4] == b"\x89PNG" else "image/jpeg"
+                return Response(data, mimetype=mt)
         except Exception:
             pass
     return Response(b"", status=204)
+
+@app.route("/api/map/list")
+def api_map_list():
+    with cfglock:
+        active = (config.get("map_file") or "").strip()
+    p = _active_map_path()
+    return jsonify({"ok": True, "maps": list_maps(), "active": os.path.basename(p) if p else active,
+                    "tiles_dir": TILES_DIR, "sources": {k: v["label"] for k, v in MAP_SOURCES.items()}})
+
+@app.route("/api/map/estimate", methods=["POST"])
+def api_map_estimate():
+    d = request.get_json(force=True)
+    try:
+        return jsonify({"ok": True, **map_estimate(float(d["lat"]), float(d["lon"]), float(d.get("radius_km", 100)),
+                                                   int(d.get("min_zoom", 5)), int(d.get("max_zoom", 12)))})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+@app.route("/api/map/download", methods=["POST"])
+def api_map_download():
+    d = request.get_json(force=True)
+    try:
+        ok, err = start_map_download(d.get("name") or "home-area", float(d["lat"]), float(d["lon"]),
+                                     float(d.get("radius_km", 100)), int(d.get("min_zoom", 5)),
+                                     int(d.get("max_zoom", 12)), d.get("source", "usgs_topo"))
+    except (KeyError, TypeError, ValueError) as e:
+        return jsonify({"ok": False, "error": f"Bad parameters: {e}"})
+    return jsonify({"ok": ok, "error": err})
+
+@app.route("/api/map/status")
+def api_map_status():
+    with _map_dl_lock:
+        return jsonify({"ok": True, **{k: v for k, v in _map_dl.items() if k != "cancel"}})
+
+@app.route("/api/map/cancel", methods=["POST"])
+def api_map_cancel():
+    with _map_dl_lock:
+        _map_dl["cancel"] = True
+    return jsonify({"ok": True})
+
+@app.route("/api/map/select", methods=["POST"])
+def api_map_select():
+    d = request.get_json(force=True)
+    f = os.path.basename((d.get("file") or "").strip())
+    if f and not os.path.isfile(os.path.join(TILES_DIR, f)):
+        return jsonify({"ok": False, "error": "File not found in tiles/"})
+    with cfglock:
+        config["map_file"] = f
+        save_config(config)
+    return jsonify({"ok": True, "active": f})
+
+@app.route("/api/map/delete", methods=["POST"])
+def api_map_delete():
+    d = request.get_json(force=True)
+    f = os.path.basename((d.get("file") or "").strip())
+    p = os.path.join(TILES_DIR, f)
+    if not f.lower().endswith(".mbtiles") or not os.path.isfile(p):
+        return jsonify({"ok": False, "error": "File not found"})
+    global _mbtiles_conn, _mbtiles_path
+    with _mbtiles_lock:
+        if _mbtiles_path == p and _mbtiles_conn:
+            try:
+                _mbtiles_conn.close()
+            except Exception:
+                pass
+            _mbtiles_conn = None
+            _mbtiles_path = None
+    try:
+        os.remove(p)
+    except OSError as e:
+        return jsonify({"ok": False, "error": str(e)})
+    with cfglock:
+        if (config.get("map_file") or "") == f:
+            config["map_file"] = ""
+            save_config(config)
+    return jsonify({"ok": True})
+
+@app.route("/api/test", methods=["POST"])
+def api_test():
+    """Generic settings tester used by the Test buttons in Settings."""
+    d = request.get_json(force=True) or {}
+    what = d.get("what", "")
+    try:
+        if what == "varac_exe":
+            p = d.get("path", "")
+            if not p:
+                return jsonify({"ok": False, "message": "No path entered"})
+            if not os.path.isfile(p):
+                return jsonify({"ok": False, "message": "File not found"})
+            running = _is_process_running(os.path.basename(p))
+            return jsonify({"ok": True, "message": f"Found {os.path.basename(p)} — VarAC is {'running' if running else 'not running (it will be launched at startup)'}"})
+        if what == "bbs_dir":
+            override = (d.get("path") or "").strip()
+            bbs = override or get_bbs_directory()
+            if not bbs:
+                return jsonify({"ok": False, "message": "No BBS directory: set the VarAC exe path (it is read from VarAC.ini) or enter an override"})
+            if not os.path.isdir(bbs):
+                return jsonify({"ok": False, "message": f"Directory not found: {bbs}"})
+            n = len([f for f in os.listdir(bbs) if "SITREP" in f.upper()])
+            return jsonify({"ok": True, "message": f"BBS folder OK: {bbs} ({n} sitrep file(s))"})
+        if what == "aprs_is":
+            return jsonify(_test_aprs_is(d.get("server"), d.get("port"), d.get("callsign"), d.get("passcode")))
+        if what == "aprs_fi":
+            return jsonify(_test_aprs_fi(d.get("key")))
+        if what == "kiss":
+            return jsonify(_test_tcp(d.get("host"), d.get("port"), "Soundmodem KISS"))
+        if what == "varafm":
+            addr = (d.get("addr") or "localhost:8300").rsplit(":", 1)
+            return jsonify(_test_tcp("127.0.0.1", addr[-1], "VARA FM"))
+        if what == "pat":
+            return jsonify(_test_pat(d.get("http_addr"), d.get("exe_path")))
+        if what == "exe":
+            p = d.get("path", "")
+            return jsonify({"ok": bool(p) and os.path.isfile(p), "message": "File found" if p and os.path.isfile(p) else ("File not found" if p else "No path entered")})
+        if what == "github":
+            return jsonify(_test_github(d.get("token")))
+        if what == "beacon":
+            lat, lon = float(d.get("lat") or 0), float(d.get("lon") or 0)
+            if not lat or not lon:
+                return jsonify({"ok": False, "message": "Latitude/longitude not set"})
+            base = (d.get("callsign") or "").strip().upper().split("-")[0]
+            if not base:
+                return jsonify({"ok": False, "message": "Set the home callsign first"})
+            pos = f"!{_lat_to_aprs(lat)}{d.get('symbol_table') or '/'}{_lon_to_aprs(lon)}{d.get('symbol_code') or '-'}{d.get('comment') or 'HamLink Radio'}"
+            return jsonify({"ok": True, "message": f"Beacon packet preview (not transmitted): {base}{d.get('ssid') or '-5'}>APRS,TCPIP*:{pos}"})
+        if what == "validate":
+            with cfglock:
+                snap = copy.deepcopy(config)
+            return jsonify({"ok": True, "warnings": validate_config(snap)})
+        return jsonify({"ok": False, "message": f"Unknown test '{what}'"})
+    except Exception as e:
+        return jsonify({"ok": False, "message": f"Test failed: {e}"})
+
+@app.route("/api/open_folder", methods=["POST"])
+def api_open_folder():
+    """Open the HamLink folder (where config.json lives) in the file manager."""
+    try:
+        if sys.platform == "win32":
+            os.startfile(APP_DIR)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", APP_DIR])
+        else:
+            subprocess.Popen(["xdg-open", APP_DIR])
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
 
 @app.route("/api/status")
 def api_status():
@@ -3463,6 +3970,10 @@ def api_status():
             "version": _running_version(),
             "demo": DEMO_MODE,
             "update": dict(state["update"]),
+            "config_path": CONFIG_PATH,
+            "app_dir": APP_DIR,
+            "tiles_dir": TILES_DIR,
+            "config_saved_at": state.get("config_saved_at"),
         })
 
 @app.route("/api/update/status")
@@ -4015,7 +4526,7 @@ def api_set_config():
                    "bbs_directory",
                    "poll_interval_seconds", "watch_callsigns",
                    "alert_sound", "alert_volume", "operator_name", "home_callsign",
-                   "quick_replies", "map_state"]:
+                   "quick_replies", "map_state", "map_file"]:
             if k in d:
                 config[k] = d[k]
         if "pushover" in d:
@@ -4050,6 +4561,12 @@ def api_set_config():
                     config["updates"][uk] = d["updates"][uk]
         save_config(config)
         new_db = config.get("varac_db_path", "")
+        snap = copy.deepcopy(config)
+    saved_at = datetime.now(timezone.utc).isoformat()
+    with slock:
+        state["config_saved_at"] = saved_at
+    log.info("Settings saved to %s", CONFIG_PATH)
+    warnings = validate_config(snap)
     if new_db != old_db and new_db and os.path.isfile(new_db):
         init_hwm()
     # Launch VarAC if configured
@@ -4082,7 +4599,7 @@ def api_set_config():
     # Start/restart relay thread if enabled
     if relay_on:
         start_relay()
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "path": CONFIG_PATH, "saved_at": saved_at, "warnings": warnings})
 
 
 @app.route("/api/aprs_reply", methods=["POST"])
@@ -4900,6 +5417,24 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
 .progress.indet>i{width:40%;animation:indet 1.2s ease-in-out infinite}
 @keyframes indet{0%{margin-left:-40%}100%{margin-left:100%}}
 
+/* ---------- Settings file + save confirmation ---------- */
+.cfgfile{background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:10px 12px;font-size:12.5px;margin-bottom:12px}
+.cfgfile code{font-family:var(--mono);font-size:11.5px;word-break:break-all;color:var(--text2)}
+.cfgfile-row{display:flex;align-items:center;gap:8px;margin-top:6px;color:var(--text3);font-size:11.5px}
+.cfgfile-row .spacer{flex:1}
+.saved-box{text-align:left}
+.saved-box .path{font-family:var(--mono);font-size:12px;word-break:break-all;background:var(--surface2);padding:8px 10px;border-radius:8px;margin:8px 0}
+.saved-box ul{margin:6px 0 0 18px;font-size:13px}
+.saved-box li{margin:3px 0}
+.saved-box li.error{color:var(--red)}
+.saved-box li.warn{color:var(--amber)}
+.saved-box li.info{color:var(--text2)}
+.maplist{display:flex;flex-direction:column;gap:6px;margin:8px 0}
+.mapitem{display:flex;align-items:center;gap:8px;padding:8px 10px;border:1px solid var(--border);border-radius:8px;font-size:13px;background:var(--surface2)}
+.mapitem.active{border-color:var(--green);background:var(--green-soft)}
+.mapitem .meta{color:var(--text3);font-size:11.5px}
+.mapitem .grow{flex:1;min-width:0}
+
 /* ---------- Footer ---------- */
 .footer{text-align:center;margin-top:36px;color:var(--text3);font-size:11.5px}
 .footer a{color:inherit}
@@ -5020,13 +5555,13 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
       <div style="min-width:0"><h1>HamLink Radio<span class="demo-tag hidden" id="demoTag">Demo</span></h1><div class="sub" id="headerSub">Waiting for messages…</div></div>
     </div>
     <div class="header-actions">
-      <button class="btn icon" id="btnTheme" onclick="toggleTheme()" title="Toggle light/dark theme" aria-label="Toggle theme">🌙</button>
-      <button class="btn icon" onclick="openSett()" title="Settings" aria-label="Settings">⚙️</button>
+      <button class="btn icon" id="btnTheme" onclick="toggleTheme()" title="Switch between light and dark theme" aria-label="Toggle theme">🌙</button>
+      <button class="btn icon" onclick="openSett()" title="Settings: callsigns, channels, alerts, maps, updates" aria-label="Settings">⚙️</button>
     </div>
   </div>
   <nav class="tabs" aria-label="Views">
-    <button class="tab active" id="tabDashboard" onclick="switchTab('dashboard')">Dashboard</button>
-    <button class="tab" id="tabMap" onclick="switchTab('map')">Offline Map</button>
+    <button class="tab active" id="tabDashboard" onclick="switchTab('dashboard')" title="Messages, status, and replies">Dashboard</button>
+    <button class="tab" id="tabMap" onclick="switchTab('map')" title="The traveler's last position on a map that works without internet">Offline Map</button>
   </nav>
 </header>
 
@@ -5036,8 +5571,8 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
     <span>🎉 <b id="updText">A new version of HamLink is available</b></span>
     <a id="updLink" href="#" target="_blank" rel="noopener">What's new</a>
     <span class="spacer"></span>
-    <button class="btn xs primary" onclick="openUpdate()">Update now</button>
-    <button class="btn xs ghost" onclick="skipUpdate()">Later</button>
+    <button class="btn xs primary" onclick="openUpdate()" title="Download and install the new version, then restart HamLink">Update now</button>
+    <button class="btn xs ghost" onclick="skipUpdate()" title="Hide this banner for this version">Later</button>
   </div>
 </div>
 
@@ -5064,7 +5599,8 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
   <div class="empty" id="mapNoConfig">
     <div class="icon">🗺️</div>
     <p>No offline map configured.</p>
-    <p style="margin-top:6px">Select a state in Settings and place the matching <code>.mbtiles</code> file in the <code>tiles/</code> folder.</p>
+    <p style="margin-top:6px">Open Settings → Offline map and press <b>Download map</b> for the area around home. It works without internet afterwards.</p>
+    <p style="margin-top:10px"><button class="btn sm primary" onclick="openSett()">Open Settings</button></p>
   </div>
   <div id="mapContainer"></div>
   <div class="card map-info" id="mapPosInfo">
@@ -5084,11 +5620,11 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
     <div class="hero-title" id="statusTitle">Waiting for check-in…</div>
     <div class="hero-sub" id="statusSub">The monitor is watching for messages.</div>
     <div class="pills" id="pills">
-      <span class="pill" id="pillInet"><i class="dot" id="inetDot"></i><span id="inetText">Internet</span></span>
-      <span class="pill" id="pillDb"><i class="dot" id="connDot"></i><span id="connText">VarAC</span></span>
-      <span class="pill hidden" id="aprsConn"><i class="dot" id="aprsDot"></i><span id="aprsText">APRS</span></span>
-      <span class="pill hidden" id="kissConn"><i class="dot" id="kissDot"></i><span id="kissText">APRS RF</span></span>
-      <span class="pill hidden" id="patConn"><i class="dot" id="patDot"></i><span id="patText">Winlink</span></span>
+      <span class="pill" id="pillInet" title="Internet connectivity, checked every poll. When it is down, APRS and Winlink can fall back to radio."><i class="dot" id="inetDot"></i><span id="inetText">Internet</span></span>
+      <span class="pill" id="pillDb" title="Connection to the VarAC database (VarAC.db). Green = VMails are being monitored."><i class="dot" id="connDot"></i><span id="connText">VarAC</span></span>
+      <span class="pill hidden" id="aprsConn" title="APRS-IS: the APRS internet network. Green = logged in and receiving."><i class="dot" id="aprsDot"></i><span id="aprsText">APRS</span></span>
+      <span class="pill hidden" id="kissConn" title="APRS over radio through Soundmodem's KISS port."><i class="dot" id="kissDot"></i><span id="kissText">APRS RF</span></span>
+      <span class="pill hidden" id="patConn" title="Winlink through the Pat client. Green = Pat is running and syncing."><i class="dot" id="patDot"></i><span id="patText">Winlink</span></span>
     </div>
     <div class="rf-countdown hidden" id="rfCountdown">Next RF Winlink sync: <b id="rfCountdownTime"></b></div>
   </section>
@@ -5104,12 +5640,12 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
         <a href="#" onclick="switchTab('map');return false" id="locMapLink">Offline map</a>
       </div>
     </div>
-    <button class="btn xs hidden" id="locAckBtn" onclick="ackPosition()">✓ Seen</button>
+    <button class="btn xs hidden" id="locAckBtn" onclick="ackPosition()" title="Acknowledge the new position and stop the highlight">✓ Seen</button>
   </section>
 
   <div class="actions">
-    <button class="btn green big hidden" id="btnSendMsg" onclick="openCompose('multi')">✉️ Send Message</button>
-    <button class="btn primary big hidden" id="btnSitrep" onclick="openSitrep()">📋 Post Sitrep to BBS</button>
+    <button class="btn green big hidden" id="btnSendMsg" onclick="openCompose('multi')" title="Write a new message and send it on any of the available channels">✉️ Send Message</button>
+    <button class="btn primary big hidden" id="btnSitrep" onclick="openSitrep()" title="Post a family status report to the VarAC BBS and announce it on the air">📋 Post Sitrep to BBS</button>
   </div>
 
   <div class="section-label">New Messages <span class="count hidden" id="activeCount"></span></div>
@@ -5125,9 +5661,9 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
     <textarea class="textarea" id="replyText" placeholder="Type your message…" oninput="onComposeInput()"></textarea>
     <div class="counter" id="charCounter"></div>
     <div class="channels">
-      <label id="chkAprsLabel"><input type="checkbox" id="chkAprs" checked> APRS <span class="path" id="aprsPathLabel">(internet)</span></label>
-      <label id="chkWinlinkLabel"><input type="checkbox" id="chkWinlink" checked> Winlink <span class="path" id="wlPathLabel">(internet)</span></label>
-      <label id="chkVaracLabel"><input type="checkbox" id="chkVarac" checked> VarAC <span class="path" id="varacPathLabel">(queued to outbox)</span></label>
+      <label id="chkAprsLabel" title="Short message (67 characters) to the traveler's APRS address. Goes over the internet, or over radio when the internet is down."><input type="checkbox" id="chkAprs" checked> APRS <span class="path" id="aprsPathLabel">(internet)</span></label>
+      <label id="chkWinlinkLabel" title="Email-style message to the traveler's Winlink tactical address."><input type="checkbox" id="chkWinlink" checked> Winlink <span class="path" id="wlPathLabel">(internet)</span></label>
+      <label id="chkVaracLabel" title="Saved to the VarAC outbox and delivered the next time the traveler connects. Never transmits by itself."><input type="checkbox" id="chkVarac" checked> VarAC <span class="path" id="varacPathLabel">(queued to outbox)</span></label>
     </div>
     <div class="notice info hidden" id="relayViaIndicator"></div>
     <div class="notice warn hidden" id="rfWarning">
@@ -5140,7 +5676,7 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
     </div>
     <div class="compose-foot">
       <div class="compose-status" id="replyStatus"></div>
-      <button class="btn green" id="sendBtn" onclick="confirmAndSend()">Send</button>
+      <button class="btn green" id="sendBtn" onclick="confirmAndSend()" title="Send on every ticked channel">Send</button>
     </div>
   </section>
 
@@ -5153,9 +5689,10 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
   <div id="logArea" class="hidden"><div id="logEntries"></div></div>
 
   <div class="footer">
-    <button class="btn sm danger" onclick="confirmShutdown()">⏻ Stop HamLink</button>
+    <button class="btn sm danger" onclick="confirmShutdown()" title="Shut down HamLink cleanly, including the radio programs it launched">⏻ Stop HamLink</button>
     <div>Stops the app and closes VarAC, Soundmodem, Pat, and VARA FM.</div>
-    <div style="margin-top:10px">HamLink Radio <span id="verText"></span> · <a href="#" onclick="checkUpdateNow(true);return false">Check for updates</a></div>
+    <div style="margin-top:10px">HamLink Radio <span id="verText"></span> · <a href="#" onclick="checkUpdateNow(true);return false" title="Ask GitHub whether a newer release exists">Check for updates</a></div>
+    <div style="margin-top:4px" id="footCfg" title="Where your settings are stored"></div>
   </div>
 </main>
 
@@ -5171,6 +5708,19 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
       <button class="btn" style="border-color:var(--red);color:var(--red)" onclick="proceedNcRf()">Emergency — immediate safety of life or property (FCC Part 97.403)</button>
       <button class="btn ghost" onclick="cancelNcRfSend()">Cancel</button>
     </div>
+  </div>
+</div>
+
+<!-- ===================== SAVED CONFIRMATION MODAL ===================== -->
+<div class="modal" id="savedModal" role="dialog" aria-modal="true" aria-labelledby="savedTitle">
+  <div class="modal-box saved-box">
+    <h3 id="savedTitle" style="color:var(--green)">✓ Settings saved</h3>
+    <p>Written to:</p>
+    <div class="path" id="savedPath"></div>
+    <p id="savedTime"></p>
+    <div id="savedWarnWrap" class="hidden"><p style="margin-top:10px"><b>Things worth checking:</b></p><ul id="savedWarnList"></ul></div>
+    <p id="savedAllGood" class="hidden" style="color:var(--green);margin-top:10px">No problems found in these settings.</p>
+    <div class="modal-actions"><button class="btn primary" onclick="$('savedModal').classList.remove('open')">OK</button></div>
   </div>
 </div>
 
@@ -5200,16 +5750,24 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
 <!-- ===================== SETTINGS DRAWER ===================== -->
 <div class="drawer-bg" id="settOverlay" onclick="if(event.target===this)closeSett()">
   <div class="drawer" role="dialog" aria-modal="true" aria-labelledby="settTitle">
-    <div class="drawer-head"><h2 id="settTitle">Settings</h2><button class="btn icon ghost" onclick="closeSett()" aria-label="Close">✕</button></div>
+    <div class="drawer-head"><h2 id="settTitle">Settings</h2><button class="btn icon ghost" onclick="closeSett()" aria-label="Close" title="Close settings (Esc)">✕</button></div>
     <div class="drawer-body">
+      <div class="cfgfile" id="cfgFile" title="Every setting on this page is stored in this file. Back it up to keep your configuration.">
+        <div><b>Settings file:</b> <code id="cfgPath">config.json</code></div>
+        <div class="cfgfile-row"><span id="cfgSaved"></span><span class="spacer"></span>
+          <button class="btn xs" onclick="copyCfgPath()" title="Copy the full path to the clipboard">Copy path</button>
+          <button class="btn xs" onclick="openFolder()" title="Open the folder that contains config.json in Explorer">Open folder</button></div>
+      </div>
+      <div class="notice warn hidden" id="saveWarnings"></div>
 
       <details class="sec" open>
         <summary>👤 People &amp; callsigns</summary>
         <div class="sec-body">
           <div class="fg"><label class="fl">Their name (shown in alerts)</label><input class="fi" id="cName" placeholder="e.g. Alex"></div>
-          <div class="fg"><label class="fl">Home station callsign (used for replies)</label><input class="fi" id="cHomeCall" placeholder="e.g. W1AW"></div>
+          <div class="fg"><label class="fl">Home station callsign (used for replies)</label><input class="fi" id="cHomeCall" placeholder="e.g. W1AW">
+            <div class="fhint">Base callsign only, no SSID. The APRS SSID (e.g. -5) is added in the APRS section.</div></div>
           <div class="fg"><label class="fl">Watch for callsign(s)</label><input class="fi" id="cWatch" placeholder="e.g. W1AW/P, W1AW">
-            <div class="fhint">Comma-separated. Leave empty to alert on every sender.</div></div>
+            <div class="fhint">Comma-separated, matched against the sender as VarAC and Winlink show it (usually <code>CALL</code> or <code>CALL/P</code>). APRS SSIDs are set in the APRS section. Leave empty to alert on every sender.</div></div>
         </div>
       </details>
 
@@ -5219,11 +5777,15 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
           <div class="fg"><label class="fl">VarAC database path</label>
             <div class="frow"><input class="fi" id="cDb" placeholder="C:\VarAC\VarAC.db"><button class="btn sm" onclick="browse('')">Browse</button><button class="btn sm primary" onclick="testDb()">Test</button></div>
             <div class="fb" id="fb"></div><div class="tr" id="dbTr"></div></div>
-          <div class="fg"><label class="fl">VarAC executable path</label><input class="fi" id="cVaracExe" placeholder="C:\VarAC\VarAC.exe">
+          <div class="fg"><label class="fl">VarAC executable path</label>
+            <div class="frow"><input class="fi" id="cVaracExe" placeholder="C:\VarAC\VarAC.exe"><button class="btn sm" onclick="runTest('varac_exe', 'varacExeTr', {path: val('cVaracExe')})" title="Check that the file exists and whether VarAC is running">Test</button></div>
+            <div class="tr" id="varacExeTr"></div>
             <div class="fhint">Launched automatically on startup if not already running. Leave blank to skip.</div></div>
           <div class="fg"><label class="fl">VarAC profile (.ini file name)</label><input class="fi w-md" id="cVaracProfile" placeholder="e.g. varac_7300.ini">
             <div class="fhint">Optional. Leave blank for the default profile.</div></div>
-          <div class="fg"><label class="fl">BBS directory override</label><input class="fi" id="cBbsDir" placeholder="Auto-read from VarAC .ini">
+          <div class="fg"><label class="fl">BBS directory override</label>
+            <div class="frow"><input class="fi" id="cBbsDir" placeholder="Auto-read from VarAC .ini"><button class="btn sm" onclick="runTest('bbs_dir', 'bbsTr', {path: val('cBbsDir')})" title="Check that the BBS folder (where sitreps are posted) exists">Test</button></div>
+            <div class="tr" id="bbsTr"></div>
             <div class="fhint">Leave blank to auto-read from the VarAC profile.</div><div class="fhint" id="bbsResolved" style="color:var(--green)"></div></div>
           <div class="fg"><label class="fl">Check every (seconds)</label><input class="fi w-xs" id="cPoll" type="number" min="5" max="300" value="15"></div>
         </div>
@@ -5282,13 +5844,17 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
             <div class="frow"><input class="fi" id="cAprsPass" placeholder="12345"><button class="btn sm" onclick="genPasscode()">Auto-generate</button></div>
             <div class="fhint">Derived from your callsign.</div></div>
           <div class="fg"><label class="fl">APRS-IS server</label><input class="fi" id="cAprsSrv" placeholder="rotate.aprs2.net"></div>
-          <div class="fg"><label class="fl">APRS-IS port</label><input class="fi w-xs" id="cAprsPort" placeholder="14580"></div>
+          <div class="fg"><label class="fl">APRS-IS port</label>
+            <div class="frow"><input class="fi w-xs" id="cAprsPort" placeholder="14580" style="flex:0"><button class="btn sm" onclick="runTest('aprs_is', 'aprsTr', {server: val('cAprsSrv'), port: val('cAprsPort'), callsign: val('cHomeCall') + (val('cAprsSsid') || '-5'), passcode: val('cAprsPass')})" title="Log in to the APRS-IS server with this callsign and passcode and report whether the passcode was accepted">Test login</button></div>
+            <div class="tr" id="aprsTr"></div></div>
           <div class="fg"><div class="tgl-row"><label class="fl">Send via RF when internet is down (needs Soundmodem)</label><div class="tgl" id="cAprsRfFallback" onclick="this.classList.toggle('on')"></div></div>
             <div class="fhint">Blocked by default at send time — requires a licensed operator present or the emergency exception.</div></div>
           <div class="fg"><div class="tgl-row"><label class="fl">Copy messages to APRS mailbox (MAIL store &amp; forward)</label><div class="tgl" id="cAprsMailbox" onclick="this.classList.toggle('on')"></div></div>
             <div class="fhint">Also sends a copy to the MAIL bot so the traveler can retrieve it later with spotty coverage.</div></div>
-          <div class="fg"><label class="fl">aprs.fi API key (optional)</label><input class="fi" id="cAprsFiKey" type="password" placeholder="free at aprs.fi/account/me" autocomplete="off">
-            <div class="fhint">On startup, fetches the traveler's latest position so you see movement that happened while HamLink was off.</div></div>
+          <div class="fg"><label class="fl">aprs.fi API key (optional)</label>
+            <div class="frow"><input class="fi" id="cAprsFiKey" type="password" placeholder="free at aprs.fi/account/me" autocomplete="off"><button class="btn sm" onclick="runTest('aprs_fi', 'aprsFiTr', {key: val('cAprsFiKey')})" title="Ask aprs.fi for the traveler's last position using this key">Test</button></div>
+            <div class="tr" id="aprsFiTr"></div>
+            <div class="fhint">On startup, fetches the traveler's latest position so you see movement that happened while HamLink was off. Get a key at <a href="https://aprs.fi/account/me" target="_blank" rel="noopener">aprs.fi → My account</a>.</div></div>
         </div>
       </details>
 
@@ -5297,9 +5863,13 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
         <div class="sec-body">
           <div class="fg"><div class="tgl-row"><label class="fl">Enable RF APRS via Soundmodem</label><div class="tgl" id="cSmOn" onclick="this.classList.toggle('on');updateBcnRfAvail()"></div></div>
             <div class="fhint">Connects to the UZ7HO Soundmodem KISS port for RF APRS receive and transmit.</div></div>
-          <div class="fg"><label class="fl">Soundmodem path</label><input class="fi" id="cSmPath" placeholder="C:\Soundmodem\soundmodem.exe"><div class="fhint">Launched automatically on startup.</div></div>
+          <div class="fg"><label class="fl">Soundmodem path</label>
+            <div class="frow"><input class="fi" id="cSmPath" placeholder="C:\Soundmodem\soundmodem.exe"><button class="btn sm" onclick="runTest('exe', 'smExeTr', {path: val('cSmPath')})" title="Check that the file exists">Test</button></div>
+            <div class="tr" id="smExeTr"></div><div class="fhint">Launched automatically on startup.</div></div>
           <div class="fg"><label class="fl">KISS TCP host</label><input class="fi w-sm" id="cSmHost" placeholder="127.0.0.1"></div>
-          <div class="fg"><label class="fl">KISS TCP port</label><input class="fi w-xs" id="cSmPort" type="number" placeholder="8100"><div class="fhint">Must match Soundmodem's KISS server port (default 8100).</div></div>
+          <div class="fg"><label class="fl">KISS TCP port</label>
+            <div class="frow"><input class="fi w-xs" id="cSmPort" type="number" placeholder="8100" style="flex:0"><button class="btn sm" onclick="runTest('kiss', 'kissTr', {host: val('cSmHost'), port: val('cSmPort')})" title="Try to connect to Soundmodem's KISS port (Soundmodem must be running)">Test connection</button></div>
+            <div class="tr" id="kissTr"></div><div class="fhint">Must match Soundmodem's KISS server port (default 8100).</div></div>
         </div>
       </details>
 
@@ -5317,6 +5887,7 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
             </select></div>
           <div class="fg"><label class="fl">Beacon interval (minutes)</label><input class="fi w-xs" id="cBcnInterval" type="number" min="5" max="120" value="30"><div class="fhint">5–120 minutes. 30 is typical for a fixed station.</div></div>
           <div class="fg"><label class="fl">Beacon comment</label><input class="fi" id="cBcnComment" placeholder="HamLink Radio"></div>
+          <div class="fg"><button class="btn sm" onclick="runTest('beacon', 'bcnTr', {lat: val('cBcnLat'), lon: val('cBcnLon'), callsign: val('cHomeCall'), ssid: val('cAprsSsid'), symbol_table: $('cBcnSymbol').value.charAt(0), symbol_code: $('cBcnSymbol').value.charAt(1), comment: val('cBcnComment')})" title="Show the exact APRS packet that would be sent (nothing is transmitted)">Preview beacon packet</button><div class="tr" id="bcnTr"></div></div>
           <div class="fg"><div class="tgl-row"><label class="fl">Beacon via APRS-IS (internet)</label><div class="tgl" id="cBcnAprsIs" onclick="this.classList.toggle('on')"></div></div></div>
           <div class="fg"><div class="tgl-row"><label class="fl">Beacon via RF (Soundmodem)</label><div class="tgl" id="cBcnRf" onclick="this.classList.toggle('on');updateBcnRfWarn()"></div></div>
             <div class="notice danger hidden" id="bcnRfWarn"><strong>FCC Part 97.221:</strong> RF beacons via Soundmodem exceed the 500 Hz limit for automatically controlled digital stations. Enabling this requires a licensed amateur radio operator present at or supervising the station, or the emergency exception (97.403).</div>
@@ -5348,7 +5919,9 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
           <div class="fg"><div class="tgl-row"><label class="fl">Enable Winlink via Pat</label><div class="tgl" id="cPatOn" onclick="this.classList.toggle('on')"></div></div>
             <div class="fhint">Email-like messaging through Winlink gateways using the Pat client.</div></div>
           <div class="fg"><label class="fl">Pat executable path</label><input class="fi" id="cPatPath" placeholder="C:\Pat\pat.exe"><div class="fhint">Launched automatically on startup.</div></div>
-          <div class="fg"><label class="fl">Pat HTTP address</label><input class="fi w-md" id="cPatAddr" placeholder="localhost:8080"></div>
+          <div class="fg"><label class="fl">Pat HTTP address</label>
+            <div class="frow"><input class="fi w-md" id="cPatAddr" placeholder="localhost:8080" style="flex:0"><button class="btn sm" onclick="runTest('pat', 'patTr', {http_addr: val('cPatAddr'), exe_path: val('cPatPath')})" title="Check the pat.exe path and whether Pat is answering on this address">Test</button></div>
+            <div class="tr" id="patTr"></div></div>
           <div class="fg"><label class="fl">Check Winlink every (seconds)</label><input class="fi w-xs" id="cPatPoll" type="number" min="60" max="900" value="300"><div class="fhint">Full sync with the Winlink CMS. Minimum 60 seconds.</div></div>
           <div class="fg"><div class="tgl-row"><label class="fl">Query Winlink position reports</label><div class="tgl" id="cPatPosReports" onclick="this.classList.toggle('on')"></div></div>
             <div class="fhint">Checks the Winlink CMS for the traveler's latest position report.</div></div>
@@ -5373,8 +5946,12 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
           <div class="fg"><label class="fl">VARA FM gateway</label>
             <div class="frow"><input class="fi w-sm" id="cPatRfGw" placeholder="e.g. W3ADO-10" style="flex:0"><button class="btn sm" onclick="loadGateways()">Find nearby</button></div>
             <div class="gw fhint" id="gwList"></div></div>
-          <div class="fg"><label class="fl">VARA FM executable path</label><input class="fi" id="cPatVaraExe" placeholder="C:\VARA FM\VARAFM.exe"><div class="fhint">Leave blank if VARA FM is already running.</div></div>
-          <div class="fg"><label class="fl">VARA FM modem address</label><input class="fi w-md" id="cPatVaraAddr" placeholder="localhost:8300"></div>
+          <div class="fg"><label class="fl">VARA FM executable path</label>
+            <div class="frow"><input class="fi" id="cPatVaraExe" placeholder="C:\VARA FM\VARAFM.exe"><button class="btn sm" onclick="runTest('exe', 'varaExeTr', {path: val('cPatVaraExe')})" title="Check that the file exists">Test</button></div>
+            <div class="tr" id="varaExeTr"></div><div class="fhint">Leave blank if VARA FM is already running.</div></div>
+          <div class="fg"><label class="fl">VARA FM modem address</label>
+            <div class="frow"><input class="fi w-md" id="cPatVaraAddr" placeholder="localhost:8300" style="flex:0"><button class="btn sm" onclick="runTest('varafm', 'varaTr', {addr: val('cPatVaraAddr')})" title="Try to connect to the VARA FM modem port (VARA FM must be running)">Test connection</button></div>
+            <div class="tr" id="varaTr"></div></div>
         </div>
       </details>
 
@@ -5384,31 +5961,43 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
           <div class="fg"><div class="tgl-row"><label class="fl">Check for new releases automatically</label><div class="tgl" id="cUpdOn" onclick="this.classList.toggle('on')"></div></div>
             <div class="fhint">Asks GitHub for the latest release shortly after startup and then periodically. Nothing is installed without your confirmation.</div></div>
           <div class="fg"><label class="fl">Check every (hours)</label><input class="fi w-xs" id="cUpdHours" type="number" min="1" max="168" value="6"></div>
-          <div class="fg"><label class="fl">GitHub token (optional)</label><input class="fi" id="cUpdToken" type="password" placeholder="Only needed while the repository is private" autocomplete="off">
-            <div class="fhint">A fine-grained token with read access to the repository's contents. Leave blank for a public repository.</div></div>
+          <div class="fg"><label class="fl">GitHub token (optional)</label>
+            <div class="frow"><input class="fi" id="cUpdToken" type="password" placeholder="github_pat_…" autocomplete="off" title="Only needed while the HamLink repository is private"><button class="btn sm" onclick="runTest('github', 'updTestTr', {token: val('cUpdToken')})" title="Ask GitHub for the latest release using this token">Test</button></div>
+            <div class="tr" id="updTestTr"></div>
+            <div class="fhint">Only needed while the HamLink repository on GitHub is <b>private</b>; leave blank once it is public. To create one: sign in to GitHub → <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">Settings → Developer settings → Fine-grained tokens → Generate new token</a>. Give it a name, set <i>Repository access</i> to <b>Only select repositories → KK4ODA/HamLink-Radio</b>, and under <i>Permissions → Repository permissions</i> set <b>Contents: Read-only</b>. Generate, copy the <code>github_pat_…</code> value, paste it here, press Test, then Save.</div></div>
           <div class="fg"><div class="fhint" id="updInfo"></div></div>
           <div class="fg"><button class="btn sm" onclick="checkUpdateNow(false)">Check now</button> <button class="btn sm primary hidden" id="updInstallBtn" onclick="closeSett();openUpdate()">Install update</button><div class="tr" id="updTr"></div></div>
         </div>
       </details>
 
       <details class="sec">
-        <summary>🗺️ Offline map</summary>
+        <summary>🗺️ Offline map <span class="state" id="stMap">Off</span></summary>
         <div class="sec-body">
-          <div class="fg"><label class="fl">State</label>
-            <select class="fsel" id="cMapState">
-              <option value="">— None —</option>
-              <option>Alabama</option><option>Alaska</option><option>Arizona</option><option>Arkansas</option><option>California</option>
-              <option>Colorado</option><option>Connecticut</option><option>Delaware</option><option>Florida</option><option>Georgia</option>
-              <option>Hawaii</option><option>Idaho</option><option>Illinois</option><option>Indiana</option><option>Iowa</option>
-              <option>Kansas</option><option>Kentucky</option><option>Louisiana</option><option>Maine</option><option>Maryland</option>
-              <option>Massachusetts</option><option>Michigan</option><option>Minnesota</option><option>Mississippi</option><option>Missouri</option>
-              <option>Montana</option><option>Nebraska</option><option>Nevada</option><option>New Hampshire</option><option>New Jersey</option>
-              <option>New Mexico</option><option>New York</option><option>North Carolina</option><option>North Dakota</option><option>Ohio</option>
-              <option>Oklahoma</option><option>Oregon</option><option>Pennsylvania</option><option>Rhode Island</option><option>South Carolina</option>
-              <option>South Dakota</option><option>Tennessee</option><option>Texas</option><option>Utah</option><option>Vermont</option>
-              <option>Virginia</option><option>Washington</option><option>West Virginia</option><option>Wisconsin</option><option>Wyoming</option>
-            </select>
-            <div class="fhint">Place the matching <code>.mbtiles</code> file (e.g. <code>georgia.mbtiles</code>) in the <code>tiles/</code> folder. Build one with <a href="https://mobac.sourceforge.io/" target="_blank" rel="noopener">MOBAC</a>.</div></div>
+          <div class="fhint" style="margin-bottom:10px">HamLink downloads map tiles from the USGS National Map (US public domain) and keeps them in the <code>tiles/</code> folder, so the map works with no internet. Pick the area around home and press Download.</div>
+          <div class="subhead" style="margin-top:0;padding-top:0;border:none">Download a map area</div>
+          <div class="fg"><label class="fl">Center (latitude / longitude)</label>
+            <div class="frow"><input class="fi" id="cMapLat" type="number" step="0.0001" placeholder="33.7490" title="Latitude of the center of the map area"><input class="fi" id="cMapLon" type="number" step="0.0001" placeholder="-84.3880" title="Longitude of the center of the map area"><button class="btn sm" onclick="mapUseBeacon()" title="Copy the coordinates from the Position beacon section">Use home position</button></div></div>
+          <div class="fg"><label class="fl">Radius around center (km)</label><input class="fi w-xs" id="cMapRadius" type="number" min="5" max="600" value="150" oninput="mapEstimate()" title="How far from the center the map should extend. 150 km covers a typical day's drive."></div>
+          <div class="fg"><label class="fl">Detail (max zoom)</label>
+            <select class="fsel w-md" id="cMapZoom" onchange="mapEstimate()" title="Higher zoom = more street detail but many more tiles to download">
+              <option value="10">10 — towns and highways (small)</option>
+              <option value="12" selected>12 — roads and neighborhoods (recommended)</option>
+              <option value="13">13 — streets</option>
+              <option value="14">14 — street names (large)</option>
+            </select></div>
+          <div class="fg"><label class="fl">Map style</label>
+            <select class="fsel" id="cMapSource" title="Which USGS basemap to download">
+              <option value="usgs_topo">USGS Topo — roads, terrain, place names</option>
+              <option value="usgs_imagery">USGS Imagery + Topo — satellite with labels</option>
+            </select></div>
+          <div class="fg"><label class="fl">Name for this map</label><input class="fi w-md" id="cMapName" placeholder="home-area" title="File name for the downloaded map (saved as tiles/<name>.mbtiles)"></div>
+          <div class="fg"><div class="fhint" id="mapEst"></div></div>
+          <div class="fg"><button class="btn sm primary" id="mapDlBtn" onclick="mapDownload()" title="Download the tiles for this area now. You can keep using HamLink while it runs.">⬇️ Download map</button>
+            <button class="btn sm ghost hidden" id="mapCancelBtn" onclick="mapCancel()">Cancel</button>
+            <div class="progress hidden" id="mapProgress"><i></i></div><div class="fhint" id="mapDlStatus"></div></div>
+          <div class="subhead">Maps on this computer</div>
+          <div class="maplist" id="mapList"><div class="fhint">Loading…</div></div>
+          <div class="fhint">Files live in <code id="tilesDirText">tiles/</code>. You can also drop an <code>.mbtiles</code> file made elsewhere into that folder.</div>
         </div>
       </details>
 
@@ -5417,8 +6006,9 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
       </div>
     </div>
     <div class="drawer-foot">
-      <button class="btn ghost" onclick="closeSett()">Cancel</button>
-      <button class="btn primary" style="flex:1" onclick="saveSett()">Save settings</button>
+      <button class="btn ghost" onclick="closeSett()" title="Close without saving">Cancel</button>
+      <button class="btn" onclick="checkSettings()" title="Look for mistakes in the current saved settings without changing anything">Check settings</button>
+      <button class="btn primary" style="flex:1" onclick="saveSett()" title="Write all settings to config.json and apply them">Save settings</button>
     </div>
   </div>
 </div>
@@ -5592,6 +6182,7 @@ function ui(d){
   const c = d.config;
   show('demoTag', !!d.demo);
   $('verText').textContent = d.version ? 'v' + d.version : '';
+  if (d.config_path) $('footCfg').textContent = 'Settings: ' + d.config_path;
 
   // --- connection pills ---
   setDot('inetDot', 'inetText', d.internet_up ? 'ok' : 'err', d.internet_up ? 'Internet' : 'No internet');
@@ -5648,7 +6239,7 @@ function ui(d){
     $('locTime').textContent = fmtTime(pos.time);
     $('locDetails').textContent = posDetails(pos);
     $('locLink').href = 'https://www.google.com/maps?q=' + pos.lat + ',' + pos.lon;
-    show('locMapLink', !!c.map_state);
+    show('locMapLink', !!(c.map_file || c.map_state));
     const key = posKey(pos);
     if (_ackedPosKey === null) _ackedPosKey = key;   // the first position seen is not "new"
     const isNew = key !== _ackedPosKey;
@@ -5837,10 +6428,10 @@ function card(a, isActive){
   let actions = '';
   if (isActive){
     actions = '<div class="msg-actions">'
-      + (!dismissed ? '<button class="btn sm" data-act="dismiss" data-id="' + id + '">🔕 Dismiss alert</button>' : '')
-      + (a.type !== 'relay' ? '<button class="btn sm primary" data-act="reply" data-chan="' + replyChan + '" data-to="' + esc(a.from_call || '') + '">💬 Reply</button>' : '')
-      + '<button class="btn sm ghost" data-act="close" data-id="' + id + '">✕ Close</button>'
-      + (a.type === 'vmail' ? '<button class="btn sm danger" data-act="delete" data-id="' + id + '">🗑 Delete</button>' : '')
+      + (!dismissed ? '<button class="btn sm" data-act="dismiss" data-id="' + id + '" title="Stop the alarm but keep this message here so you can reply">🔕 Dismiss alert</button>' : '')
+      + (a.type !== 'relay' ? '<button class="btn sm primary" data-act="reply" data-chan="' + replyChan + '" data-to="' + esc(a.from_call || '') + '" title="Answer this message on the same channel">💬 Reply</button>' : '')
+      + '<button class="btn sm ghost" data-act="close" data-id="' + id + '" title="File this message under Previous Messages">✕ Close</button>'
+      + (a.type === 'vmail' ? '<button class="btn sm danger" data-act="delete" data-id="' + id + '" title="Permanently delete this VMail from VarAC.db">🗑 Delete</button>' : '')
       + '</div>';
   }
   const fromLine = a.type === 'relay' ? 'Relay station ' + esc(a.relay_station || name) : '📨 ' + esc(name) + ' → You';
@@ -6043,6 +6634,7 @@ function _stateBadges(c){
   set('stSm', !!(c.soundmodem && c.soundmodem.enabled)); set('stBcn', !!(c.beacon && c.beacon.enabled));
   set('stRelay', !!(c.relay && c.relay.enabled)); set('stPat', !!(c.pat && c.pat.enabled));
   set('stUpd', !(c.updates && c.updates.auto_check === false));
+  set('stMap', !!(c.map_file || c.map_state));
 }
 async function fillForm(){
   try { const r = await fetch('/api/status'); const d = await r.json(); cfg = d.config || cfg; } catch(e){}
@@ -6061,8 +6653,13 @@ async function fillForm(){
   setOn('cAprsOn', ap.enabled); $('cAprsSsid').value = ap.home_ssid || '-5'; $('cAprsTravSsid').value = ap.traveler_ssids || ap.traveler_ssid || '-7';
   $('cAprsPass').value = ap.passcode || ''; $('cAprsSrv').value = ap.server || 'rotate.aprs2.net'; $('cAprsPort').value = ap.port || 14580;
   setOn('cAprsRfFallback', ap.rf_fallback); setOn('cAprsMailbox', ap.use_mailbox); $('cAprsFiKey').value = ap.aprs_fi_api_key || '';
-  $('cMapState').value = c.map_state || '';
   const b = c.beacon || {};
+  if (!$('cMapLat').value && b.lat && b.lon){ $('cMapLat').value = b.lat; $('cMapLon').value = b.lon; }
+  if (!$('cMapName').value) $('cMapName').value = 'home-area';
+  loadMapList(); mapEstimate();
+  document.querySelectorAll('.tr').forEach(t => { if (!/^(dbTr|poTr|updTr)$/.test(t.id)) t.className = 'tr'; });
+  if (last){ $('cfgPath').textContent = last.config_path || 'config.json'; $('cfgSaved').textContent = last.config_saved_at ? 'Last saved ' + fmtTime(last.config_saved_at) : 'Loaded from disk at startup'; }
+  show('saveWarnings', false);
   setOn('cBcnOn', b.enabled); $('cBcnLat').value = b.lat || ''; $('cBcnLon').value = b.lon || '';
   $('cBcnSymbol').value = (b.symbol_table || '/') + (b.symbol_code || '-') + ' ';
   $('cBcnInterval').value = b.interval_minutes || 30; $('cBcnComment').value = b.comment || 'HamLink Radio';
@@ -6090,7 +6687,7 @@ async function saveSett(){
     operator_name: val('cName'), home_callsign: val('cHomeCall').toUpperCase(),
     watch_callsigns: val('cWatch').split(',').map(s => s.trim().toUpperCase()).filter(Boolean),
     varac_exe_path: val('cVaracExe'), varac_profile: val('cVaracProfile'), bbs_directory: val('cBbsDir'), varac_db_path: val('cDb'),
-    poll_interval_seconds: num('cPoll', 15), map_state: $('cMapState').value, alert_sound: $('cSound').value, alert_volume: num('cVol', 30) / 100,
+    poll_interval_seconds: num('cPoll', 15), alert_sound: $('cSound').value, alert_volume: num('cVol', 30) / 100,
     quick_replies: $('cQuick').value.split('\n').map(s => s.trim()).filter(Boolean),
     pushover: {enabled: isOn('cPoOn'), user_key: val('cPoUser'), api_token: val('cPoToken'), priority: num('cPoPri', 1), sound: $('cPoSnd').value, quick_replies: isOn('cPoQuickReplies')},
     aprs: {enabled: isOn('cAprsOn'), home_ssid: val('cAprsSsid') || '-5', traveler_ssids: val('cAprsTravSsid') || '-7', passcode: val('cAprsPass'),
@@ -6110,9 +6707,115 @@ async function saveSett(){
   };
   try {
     const r = await cpost('/api/config', p); const d = await r.json();
-    if (d.ok){ closeSett(); toast('Settings saved'); poll(); } else toast(d.error || 'Save failed', true);
+    if (!d.ok){ toast(d.error || 'Save failed', true); return; }
+    closeSett(); poll();
+    showSavedModal(d.path, d.saved_at, d.warnings || []);
   } catch(e){ toast('Save failed: ' + e, true); }
 }
+function showSavedModal(path, when, warnings){
+  $('savedPath').textContent = path || 'config.json';
+  $('savedTime').textContent = 'Saved ' + (when ? fmtTime(when) : 'just now') + '. The new settings are active now; VarAC, Pat, and Soundmodem are started if they were just enabled.';
+  const ul = $('savedWarnList'); ul.innerHTML = '';
+  (warnings || []).forEach(w => { const li = document.createElement('li'); li.className = w.level; li.textContent = (w.level === 'error' ? '⛔ ' : w.level === 'warn' ? '⚠️ ' : 'ℹ️ ') + w.message; ul.appendChild(li); });
+  show('savedWarnWrap', warnings && warnings.length > 0); show('savedAllGood', !warnings || warnings.length === 0);
+  $('savedModal').classList.add('open');
+  toast('✓ Settings saved to ' + (path || 'config.json').split(/[\\/]/).pop());
+}
+async function checkSettings(){
+  const box = $('saveWarnings');
+  try {
+    const r = await cpost('/api/test', {what: 'validate'}); const d = await r.json();
+    const w = d.warnings || [];
+    if (!w.length){ box.className = 'notice blue'; box.textContent = '✓ No problems found in the saved settings. (Unsaved edits on this page are not checked — press Save first.)'; }
+    else { box.className = 'notice warn'; box.innerHTML = '<b>Saved settings — things worth checking:</b><ul style="margin:6px 0 0 18px">' + w.map(x => '<li>' + (x.level === 'error' ? '⛔ ' : x.level === 'warn' ? '⚠️ ' : 'ℹ️ ') + esc(x.message) + '</li>').join('') + '</ul>'; }
+    show('saveWarnings', true); box.scrollIntoView({behavior: 'smooth', block: 'nearest'});
+  } catch(e){ toast('Check failed: ' + e, true); }
+}
+async function runTest(what, trId, fields){
+  const el = $(trId); el.className = 'tr ok'; el.textContent = 'Testing…';
+  try {
+    const r = await cpost('/api/test', Object.assign({what}, fields || {})); const d = await r.json();
+    el.className = d.ok ? 'tr ok' : 'tr err'; el.textContent = (d.ok ? '✓ ' : '✕ ') + (d.message || d.error || (d.ok ? 'OK' : 'Failed'));
+  } catch(e){ el.className = 'tr err'; el.textContent = 'Test failed: ' + e; }
+}
+function copyCfgPath(){
+  const p = $('cfgPath').textContent;
+  if (navigator.clipboard) navigator.clipboard.writeText(p).then(() => toast('Path copied'), () => toast(p));
+  else toast(p);
+}
+function openFolder(){ cpost('/api/open_folder').then(r => r.json()).then(d => { if (!d.ok) toast(d.error || 'Could not open folder', true); }); }
+
+/* ---------- offline map downloader ---------- */
+let _mapPollTimer = null;
+function mapUseBeacon(){
+  const la = $('cBcnLat').value, lo = $('cBcnLon').value;
+  if (!la || !lo){ toast('Set the home position in the Position beacon section first (or use 📍 Detect there)', true); return; }
+  $('cMapLat').value = la; $('cMapLon').value = lo; mapEstimate();
+}
+async function mapEstimate(){
+  const lat = parseFloat($('cMapLat').value), lon = parseFloat($('cMapLon').value);
+  if (isNaN(lat) || isNaN(lon)){ $('mapEst').textContent = 'Enter a center point to see the download size.'; return; }
+  try {
+    const r = await cpost('/api/map/estimate', {lat, lon, radius_km: num('cMapRadius', 150), min_zoom: 5, max_zoom: parseInt($('cMapZoom').value)});
+    const d = await r.json();
+    $('mapEst').textContent = d.ok ? 'About ' + d.tiles.toLocaleString() + ' tiles, roughly ' + d.mb + ' MB.' + (d.tiles > 40000 ? ' That is a lot — consider a smaller radius or lower detail.' : '') : (d.error || '');
+  } catch(e){}
+}
+async function mapDownload(){
+  const lat = parseFloat($('cMapLat').value), lon = parseFloat($('cMapLon').value);
+  if (isNaN(lat) || isNaN(lon)){ toast('Enter a center point first', true); return; }
+  const name = val('cMapName') || 'home-area';
+  try {
+    const r = await cpost('/api/map/download', {name, lat, lon, radius_km: num('cMapRadius', 150), min_zoom: 5, max_zoom: parseInt($('cMapZoom').value), source: $('cMapSource').value});
+    const d = await r.json();
+    if (!d.ok){ toast(d.error || 'Could not start download', true); return; }
+    $('mapDlBtn').disabled = true; show('mapCancelBtn', true); show('mapProgress', true);
+    if (!_mapPollTimer) _mapPollTimer = setInterval(mapPoll, 1000);
+  } catch(e){ toast('Download failed: ' + e, true); }
+}
+function mapCancel(){ cpost('/api/map/cancel'); }
+async function mapPoll(){
+  try {
+    const r = await fetch('/api/map/status'); const s = await r.json();
+    const pct = s.total ? Math.round(s.done * 100 / s.total) : 0;
+    $('mapProgress').firstElementChild.style.width = pct + '%';
+    if (s.running){ $('mapDlStatus').textContent = 'Downloading ' + s.name + ': ' + s.done.toLocaleString() + ' / ' + s.total.toLocaleString() + ' tiles (' + pct + '%)' + (s.failed ? ', ' + s.failed + ' failed' : ''); return; }
+    clearInterval(_mapPollTimer); _mapPollTimer = null;
+    $('mapDlBtn').disabled = false; show('mapCancelBtn', false);
+    if (s.error){ $('mapDlStatus').textContent = s.error; show('mapProgress', false); }
+    else if (s.file){ $('mapDlStatus').textContent = '✓ ' + s.file + ' is ready and selected for the Offline Map tab.' + (s.failed ? ' (' + s.failed + ' tiles could not be fetched.)' : ''); toast('Map ready: ' + s.file); loadMapList(); poll(); }
+  } catch(e){}
+}
+async function loadMapList(){
+  const el = $('mapList');
+  try {
+    const r = await fetch('/api/map/list'); const d = await r.json();
+    $('tilesDirText').textContent = d.tiles_dir || 'tiles/';
+    if (!d.maps.length){ el.innerHTML = '<div class="fhint">No maps downloaded yet.</div>'; return; }
+    el.innerHTML = d.maps.map(m => {
+      const active = m.file === d.active;
+      return '<div class="mapitem' + (active ? ' active' : '') + '"><div class="grow"><b>' + esc(m.file) + '</b> <span class="meta">' + m.size_mb + ' MB' + (m.maxzoom ? ' · zoom ' + esc(m.minzoom) + '–' + esc(m.maxzoom) : '') + (m.attribution ? ' · ' + esc(m.attribution) : '') + '</span></div>'
+        + (active ? '<span class="chip new" title="Shown on the Offline Map tab">In use</span>' : '<button class="btn xs primary" data-map="' + esc(m.file) + '" data-map-act="select" title="Show this map on the Offline Map tab">Use</button>')
+        + '<button class="btn xs danger" data-map="' + esc(m.file) + '" data-map-act="delete" title="Delete this map file from the tiles folder">Delete</button></div>';
+    }).join('');
+    el.querySelectorAll('[data-map-act]').forEach(b => b.onclick = () => b.dataset.mapAct === 'select' ? mapSelect(b.dataset.map) : mapDelete(b.dataset.map));
+    if (_mapPollTimer === null){ fetch('/api/map/status').then(r => r.json()).then(s => { if (s.running){ $('mapDlBtn').disabled = true; show('mapCancelBtn', true); show('mapProgress', true); _mapPollTimer = setInterval(mapPoll, 1000); } }); }
+  } catch(e){ el.innerHTML = '<div class="fhint">Could not list maps.</div>'; }
+}
+async function mapSelect(f){ const r = await cpost('/api/map/select', {file: f}); const d = await r.json(); if (d.ok){ toast('Offline map: ' + f); loadMapList(); poll(); } else toast(d.error, true); }
+async function mapDelete(f){ if (!confirm('Delete ' + f + '? This removes the downloaded tiles.')) return; const r = await cpost('/api/map/delete', {file: f}); const d = await r.json(); if (d.ok){ toast('Deleted ' + f); loadMapList(); poll(); } else toast(d.error, true); }
+
+/* ---------- tooltips: give every settings control a title from its label + hint ---------- */
+function initTooltips(){
+  document.querySelectorAll('.fg, .sr-field').forEach(fg => {
+    const label = fg.querySelector('.fl, label'), hint = fg.querySelector('.fhint, .sr-hint');
+    const text = [(label ? label.textContent.trim() : ''), (hint ? hint.textContent.trim() : '')].filter(Boolean).join(' — ');
+    if (!text) return;
+    fg.querySelectorAll('input, select, textarea, .tgl').forEach(el => { if (!el.title) el.title = text; });
+  });
+  document.querySelectorAll('.sec > summary').forEach(s => { if (!s.title) s.title = 'Click to expand or collapse this section'; });
+}
+initTooltips();
 function updateBcnRfWarn(){ show('bcnRfWarn', isOn('cBcnRf')); }
 function updateBcnRfAvail(){
   const smOn = isOn('cSmOn'), t = $('cBcnRf');
@@ -6253,13 +6956,13 @@ function switchTab(tab){
 }
 let _map = null, _marker = null, _lastMapPos = null;
 function initMap(){
-  const mapState = last && last.config ? last.config.map_state : '';
+  const mapState = last && last.config ? (last.config.map_file || last.config.map_state) : '';
   show('mapNoConfig', !mapState); $('mapContainer').style.display = mapState ? 'block' : 'none';
   if (!mapState) return;
   if (!_map){
     L.Icon.Default.imagePath = '/static/';
     _map = L.map('mapContainer').setView([39.8, -98.5], 5);
-    L.tileLayer('/tiles/{z}/{x}/{y}.png', {maxZoom: 18, minZoom: 3, attribution: 'Offline tiles'}).addTo(_map);
+    L.tileLayer('/tiles/{z}/{x}/{y}.png', {maxZoom: 16, minZoom: 3, attribution: 'Offline tiles · USGS The National Map'}).addTo(_map);
   }
   setTimeout(() => _map.invalidateSize(), 100);
   updateMapPosition();

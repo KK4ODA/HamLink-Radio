@@ -121,6 +121,18 @@ HamLink Radio is a family emergency communications app for licensed amateur radi
 - UI: banner under the header (`showUpdateBanner`), "Later" stores the skipped tag in `localStorage.hamlink_update_skipped`, modal polls `/api/update/status` then `/api/version` until the server is back and reloads.
 - `HAMLINK_VERSION_OVERRIDE=0.1.0` makes a build pretend to be older — the way to test the update flow against a real release. Demo mode fakes an available `v9.9.9` and a no-op install.
 
+### Settings tests, validation, save confirmation (added v0.4.0)
+- `POST /api/test {what: ...}` — `varac_exe`, `bbs_dir`, `aprs_is` (real login, reads `logresp ... verified/unverified`), `aprs_fi`, `kiss`, `varafm`, `pat`, `exe`, `github`, `beacon` (packet preview, nothing sent), `validate`. UI helper `runTest(what, trId, fields)`.
+- `validate_config(cfg)` returns `[{level, field, message}]`; run on every save (returned by `/api/config` with `path` and `saved_at`) and by the **Check settings** button. Add new sanity checks there.
+- Save shows a modal with the config path, time, and warnings; `/api/status` carries `config_path`, `app_dir`, `tiles_dir`, `config_saved_at`; `/api/open_folder` opens APP_DIR.
+- `initTooltips()` gives every settings input/toggle a `title` built from its label + hint; dashboard buttons carry explicit titles.
+
+### Offline map downloader (added v0.4.0)
+- Tiles come from USGS The National Map (`MAP_SOURCES`: `usgs_topo`, `usgs_imagery`), public domain, bulk download allowed. Do not switch to tile.openstreetmap.org — its policy forbids bulk downloads.
+- `start_map_download(name, lat, lon, radius_km, zmin, zmax, source)` → thread writes `tiles/<name>.mbtiles.part` (6 workers, TMS y-flip, metadata table) then renames and sets `config.map_file`. Progress in `_map_dl`; endpoints `/api/map/{list,estimate,download,status,cancel,select,delete}`.
+- `config.map_file` (file name in tiles/) replaces the legacy `map_state` (US state name → `<state>.mbtiles`), which is still honoured by `_active_map_path()`.
+- `serve_tile` sniffs PNG vs JPEG (USGS tiles are JPEG).
+
 ### Misc robustness
 - `save_config()` writes to `config.json.tmp` then `os.replace` (atomic).
 - `log_reply()` ids are `sent-{channel}-{call}-{uuid8}` — a multi-channel send creates several entries in the same second.
@@ -134,7 +146,7 @@ HamLink Radio is a family emergency communications app for licensed amateur radi
 - **Job 2 (windows):** PyInstaller `--onefile --add-data static;static --collect-all comtypes` → `HamLink-Radio-vX.Y.Z-win64.zip` (exe + README + MANUAL + tiles/README) uploaded to the same release.
 - **Process:** bump `__version__`, commit, then `git tag -a v0.3.0 -m "v0.3.0" && git push origin v0.3.0`.
 - **Tip:** Use `feat:` / `fix:` / `docs:` prefixes in commit messages so the changelog auto-organises.
-- **History:** v0.1.0 (initial after HomeLink rebrand), v0.2.0 (UI redesign, bug fixes, demo mode, exe in CI), v0.3.0 (self-update), v0.3.1 (fix exe relaunch after update: strip _MEIPASS2/_PYI_* env before spawning the restart helper), v0.3.2 (exe opens the browser on start; --no-browser suppresses).
+- **History:** v0.1.0 (initial after HomeLink rebrand), v0.2.0 (UI redesign, bug fixes, demo mode, exe in CI), v0.3.0 (self-update), v0.3.1 (fix exe relaunch after update: strip _MEIPASS2/_PYI_* env before spawning the restart helper), v0.3.2 (exe opens the browser on start; --no-browser suppresses), v0.4.0 (settings tests/validation/save confirmation, built-in USGS map downloader, tooltips).
 
 ## File Structure
 
@@ -159,7 +171,7 @@ tiles/                  — MBTiles files (gitignored) + README.txt
 
 ## Config Structure (config.json)
 
-Key fields: `home_callsign`, `watch_callsigns[]`, `operator_name`, `varac_db_path`, `varac_exe_path`, `map_state`
+Key fields: `home_callsign`, `watch_callsigns[]`, `operator_name`, `varac_db_path`, `varac_exe_path`, `map_file` (legacy `map_state`)
 
 Nested:
 - `aprs{enabled, home_ssid, traveler_ssids, passcode, server, port, rf_fallback, use_mailbox, aprs_fi_api_key}`
@@ -167,6 +179,7 @@ Nested:
 - `pat{enabled, exe_path, http_addr, auto_launch, poll_interval, rf_fallback, rf_poll_interval, rf_gateway, varafm_addr, varafm_exe_path, position_reports, home_tactical, traveler_tactical}`
 - `beacon{enabled, lat, lon, symbol_table, symbol_code, comment, interval_minutes, via_aprsis, via_rf}`
 - `pushover{enabled, user_key, api_token, priority, retry, expire, sound, quick_replies}`
+- `updates{auto_check, interval_hours, github_token}`
 - `relay{enabled, auto_retrieve, auto_retrieve_delay_seconds, confirm_before_connect, max_retries, retry_delay_seconds, cooldown_seconds, route_replies_via_relay, ignore_stations, min_snr}`
 
 `load_config()` merges saved values over `DEFAULT_CONFIG` one level deep, so adding a key to `DEFAULT_CONFIG` is enough to introduce a new setting.

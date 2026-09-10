@@ -1,27 +1,17 @@
-HamLink Radio — Offline Map Tiles
+HamLink Radio - Offline Map Tiles
 ==================================
 
-Place your .mbtiles file in this folder. The filename should match
-your state name in lowercase with hyphens for spaces.
+You normally do not need to do anything here. Open HamLink, go to
+Settings -> Offline map, choose the area around home, and press
+"Download map". HamLink fetches the tiles from the USGS National Map
+(United States public domain) and saves them in this folder as
+<name>.mbtiles, then selects the map for the Offline Map tab.
 
-Examples:
-  georgia.mbtiles
-  new-york.mbtiles
-  north-carolina.mbtiles
+Sizes: a 150 km radius at zoom 12 is roughly 2,000 tiles / 45 MB.
+Zoom 14 (street names) is about 16x larger.
 
-How to download tiles:
-  1. Download MOBAC (Mobile Atlas Creator): https://mobac.sourceforge.io/
-  2. Open MOBAC and select "OpenStreetMap" as the map source
-  3. Select your state area on the map
-  4. Choose zoom levels 6-13 (recommended for state-level coverage)
-  5. Set output format to "MBTiles (SQLite)"
-  6. Click "Create Atlas"
-  7. Move the generated .mbtiles file to this folder
-  8. In HamLink Settings, select your state from the Offline Map dropdown
+You can also drop an .mbtiles file made with another tool (MOBAC, QGIS,
+tilemaker, etc.) into this folder; it appears under "Maps on this
+computer" in Settings with a Use button. Raster tiles (PNG/JPEG) only.
 
-Typical file sizes:
-  Small state (Rhode Island): ~20 MB
-  Medium state (Georgia): ~100-200 MB
-  Large state (Texas): ~300-500 MB
-
-The map works fully offline — no internet connection needed to view it.
+The map works fully offline - no internet connection is needed to view it.

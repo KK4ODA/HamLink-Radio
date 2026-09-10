@@ -19,7 +19,7 @@
 
 **Monitoring**
 - **Three channels, one inbox** — VarAC VMail (polls `VarAC.db`), APRS messages over APRS-IS and RF, and Winlink through the Pat client.
-- **Position tracking** — APRS beacons, Winlink position reports, and an aprs.fi backfill on startup so you never miss movement that happened while the app was off. Shown on the dashboard and on an **offline map** (MBTiles).
+- **Position tracking** — APRS beacons, Winlink position reports, and an aprs.fi backfill on startup so you never miss movement that happened while the app was off. Shown on the dashboard and on an **offline map** that HamLink downloads itself (USGS National Map tiles, no internet needed afterwards).
 - **Relay awareness** — tracks VarAC relay notifications, can auto-retrieve held VMails through VarAC's UI, and routes replies back through the same relay.
 
 **Alerting**
@@ -35,6 +35,7 @@
 - Big, clear status card; colour-coded message cards; light and dark themes; works on a PC or a phone on the same network.
 - Persistent CSV log of everything sent and received, graceful shutdown that also closes VarAC, Soundmodem, Pat, and VARA FM.
 - FCC Part 97 compliance notice on first launch and RF-path labels on every send.
+- **Test buttons** next to every external connection in Settings (VarAC, APRS-IS login, Soundmodem, Pat, VARA FM, aprs.fi, Pushover, GitHub), a settings checker that flags common mistakes, and tooltips on every control.
 
 ## How it works
 
@@ -71,7 +72,7 @@ The whole application is one Python file, `monitor.py`: a Flask backend with bac
 
 1. Accept the regulatory compliance notice, then tap **Start Monitoring** (this unlocks alert sounds in the browser).
 2. Open **Settings** (⚙️) and fill in *People & callsigns* and the *VarAC database path* (use **Browse**, then **Test**).
-3. Enable APRS, Winlink, Pushover, and the offline map as needed. Every field has a hint.
+3. Enable APRS, Winlink, Pushover, and the offline map as needed. Every field has a hint and most have a **Test** button; **Check settings** looks for common mistakes.
 
 Print **[docs/QUICK_REFERENCE.md](docs/QUICK_REFERENCE.md)** for both people — one page on how to reach each other. See **[MANUAL.md](MANUAL.md)** for the complete guide: configuration, use cases, sitreps, troubleshooting, and the FCC compliance section.
 
@@ -117,7 +118,7 @@ requirements.txt        Python dependencies
 MANUAL.md               User manual (configuration, use cases, FCC compliance, troubleshooting)
 pat-interface-notes.md  Notes on Pat's HTTP API
 static/                 Leaflet.js + marker icons for the offline map
-tiles/                  Drop your <state>.mbtiles file here (see tiles/README.txt)
+tiles/                  Offline map files (.mbtiles) — downloaded from Settings → Offline map
 docs/                   Banner, icon, screenshots
 config.json             Created on first run — your settings (not tracked in git)
 message_log.csv         Created on first run — persistent message log (not tracked in git)
