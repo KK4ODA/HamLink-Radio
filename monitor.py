@@ -16,7 +16,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, request, Response
 
-__version__ = "0.4.8"
+__version__ = "0.4.9"
 UPDATE_REPO = "KK4ODA/HamLink-Radio"   # GitHub repo checked for new releases
 
 # ---------------------------------------------------------------------------
@@ -272,7 +272,7 @@ DEFAULT_CONFIG = {
     "pushover": {"enabled": False, "user_key": "", "api_token": "",
                  "priority": 1, "retry": 60, "expire": 3600, "sound": "pushover",
                  "quick_replies": False},
-    "aprs": {"enabled": False, "home_ssid": "-5", "traveler_ssids": "-7",
+    "aprs": {"enabled": True, "home_ssid": "-5", "traveler_ssids": "-7, -9",
              "passcode": "", "server": "rotate.aprs2.net", "port": 14580,
              "use_mailbox": False, "rf_fallback": False, "aprs_fi_api_key": ""},
     "soundmodem": {"enabled": False, "exe_path": "", "kiss_host": "127.0.0.1",
