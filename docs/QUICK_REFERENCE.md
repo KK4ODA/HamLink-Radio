@@ -88,6 +88,30 @@ Pick the first channel that works, top to bottom:
 
 ---
 
+## Finding a relay path with VarAC's Path Finder
+
+Use this when the traveler cannot connect to home directly (band closed, no propagation). Another VarAC station that can hear both ends carries the VMail.
+
+**How it works**
+1. In VarAC, write the VMail to the home station as usual (e.g. to `KK4ODA`).
+2. Click **FindPath** (right-hand side of the VarAC window; also *Path find* in the right-click menu of the VMail **Parked / Outbox** list) and type the destination callsign.
+3. VarAC broadcasts the request on the calling frequency. Every station that has recently heard the destination replies with **when** it heard it, on which **frequency**, and the **SNR**. Replies trickle in over 5–50 seconds (stations wait a random time to avoid collisions), so give it a minute.
+4. Pick the best relay: the most recent report with the strongest SNR, ideally a station that runs 24/7. Connect to that station — VarAC QSYs off the calling frequency and **parks** your VMail there.
+5. Done. When the destination next beacons, the relay station tells it a VMail is waiting; the destination connects to the relay and collects it.
+
+**Requirements and tips**
+- Keep **Auto QSY** enabled in VarAC on all stations (Settings → QSY); Path Finder and relaying depend on it.
+- Path Finder only reports stations that are on the air right now and have heard the destination lately (VarAC keeps about 30 days of *last heard* data). If nobody answers, wait for a beacon cycle or try another band or time of day.
+- The relay keeps the VMail until it is collected, so one good relay is enough — no need to park the same VMail at several stations.
+- The traveler can also *peek* at the relay's parked VMails to confirm the message landed.
+
+**What HamLink does at home**
+- When a relay station is holding a VMail for home, HamLink shows a **Relay alert** card and (if relay automation is on) retrieves it automatically, or with one tap on **Retrieve now**.
+- Replies to a VMail that came through a relay are routed back through the same relay station automatically (Settings → VMail relay automation → *Route replies via relay*).
+- If home needs to originate a VMail through a relay, use the same FindPath steps in VarAC on the home PC: home's VarAC is running whenever HamLink is.
+
+---
+
 ## HamLink settings cheat sheet
 
 Every setting, with a typical value as an example. Everything lives in `config.json` next to `HamLink_Radio.exe` (the path is shown at the bottom of the dashboard). Write your own values in the blank column and keep this sheet with the printout.
