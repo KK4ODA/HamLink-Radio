@@ -16,7 +16,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, request, Response
 
-__version__ = "0.4.5"
+__version__ = "0.4.6"
 UPDATE_REPO = "KK4ODA/HamLink-Radio"   # GitHub repo checked for new releases
 
 # ---------------------------------------------------------------------------
@@ -6364,6 +6364,9 @@ async function poll(){
   } catch(e){
     // One dropped poll is normal (tab in background, brief stall); only flag after two in a row.
     if (++_pollFailures >= 2) setDot('connDot', 'connText', 'err', 'Connection to HamLink lost');
+    // If HamLink is gone (stopped, restarting, crashed) there is nothing to alert about any more —
+    // never leave a browser tab chiming on its own with no server behind it.
+    if (_pollFailures >= 3 && alarmInt){ stopAlarm(); toast('HamLink is not responding — alarm stopped', true); }
     return;
   }
   _pollFailures = 0;
@@ -7352,6 +7355,7 @@ def _seed_demo_state():
             "delivered": True, "delivered_by": "W1AW-7", "delivered_time": iso(19),
         })
         state["pending_alerts"] = [samples[0]]
+        state["alarm_silenced"] = True   # demo never rings on its own; the Preview button still works
         state["last_checkin_time"] = samples[0]["time"]
         state["last_checkin_from"] = name
         state["db_connected"] = True
