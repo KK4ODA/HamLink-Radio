@@ -16,7 +16,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, request, Response
 
-__version__ = "0.4.6"
+__version__ = "0.4.7"
 UPDATE_REPO = "KK4ODA/HamLink-Radio"   # GitHub repo checked for new releases
 
 # ---------------------------------------------------------------------------
@@ -5818,6 +5818,7 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
       <div class="loc-links">
         <a id="locLink" href="#" target="_blank" rel="noopener">Google Maps ↗</a>
         <a href="#" onclick="switchTab('map');return false" id="locMapLink">Offline map</a>
+        <a href="#" onclick="downloadMapForLastPos();return false" id="locMapDl" class="hidden" title="No offline map covers this spot yet — fetch one now (internet needed) so it works offline later">⬇️ Get offline map for this area</a>
       </div>
     </div>
     <button class="btn xs hidden" id="locAckBtn" onclick="ackPosition()" title="Acknowledge the new position and stop the highlight">✓ Seen</button>
@@ -6455,7 +6456,8 @@ function ui(d){
     $('locTime').textContent = fmtTime(pos.time);
     $('locDetails').textContent = posDetails(pos);
     $('locLink').href = 'https://www.google.com/maps?q=' + pos.lat + ',' + pos.lon;
-    show('locMapLink', !!(c.map_file || c.map_state));
+    show('locMapLink', !!d.map_active);
+    show('locMapDl', !posCovered(d, pos));
     const key = posKey(pos);
     if (_ackedPosKey === null) _ackedPosKey = key;   // the first position seen is not "new"
     const isNew = key !== _ackedPosKey;
@@ -6987,6 +6989,11 @@ function copyCfgPath(){
 function openFolder(){ cpost('/api/open_folder').then(r => r.json()).then(d => { if (!d.ok) toast(d.error || 'Could not open folder', true); }); }
 
 /* ---------- offline map downloader ---------- */
+function posCovered(d, pos){
+  const covs = ((d && d.map_coverage) || []).map(c => c.bounds).filter(b => b && b.length === 4);
+  return covs.some(b => pos.lon >= b[0] && pos.lon <= b[2] && pos.lat >= b[1] && pos.lat <= b[3]);
+}
+function downloadMapForLastPos(){ switchTab('map'); setTimeout(() => { $('mapDlCard').scrollIntoView({behavior: 'smooth', block: 'center'}); mapDownloadHere(); }, 150); }
 let _mapPollTimer = null;
 function mapUseBeacon(){
   const la = $('cBcnLat').value, lo = $('cBcnLon').value;
@@ -7257,7 +7264,9 @@ function initMap(){
   const ma = _activeMap();
   const wanted = last && last.config ? (last.config.map_file || last.config.map_state) : '';
   if (!ma){
-    $('mapNoConfigText').textContent = wanted ? 'The selected map "' + wanted + '" was not found in the tiles folder.' : 'No offline map downloaded yet.';
+    const {pos: p0} = currentPos(last || {});
+    $('mapNoConfigText').innerHTML = (wanted ? 'The selected map "' + esc(wanted) + '" was not found in the tiles folder.' : 'No offline map downloaded yet.')
+      + (p0 ? ' <button class="btn sm primary" onclick="mapDownloadHere()" title="Fetch USGS tiles for 100 km around the last position">⬇️ Download map around last position</button>' : '');
     show('mapNoConfig', true); $('mapContainer').style.display = 'none'; show('mapOutside', false); $('mapPosInfo').style.display = 'none'; $('mapMeta').textContent = '';
     $('mapDlCard').style.display = currentPos(last || {}).pos ? 'block' : 'none';
     return;
@@ -7301,7 +7310,7 @@ function updateMapPosition(){
   const inside = covs.length === 0 ? (!_mapBounds || _mapBounds.contains(ll)) : covs.some(b => b.contains(ll));
   if (key !== _lastMapPos){ _lastMapPos = key; if (inside) _map.setView(ll, Math.min(10, (_activeMap() || {}).maxzoom || 10)); }   // only recenter when the position changes
   const mo = $('mapOutside');
-  if (!inside){ mo.innerHTML = '📍 ' + esc(name) + '\'s last position (' + pos.lat.toFixed(3) + ', ' + pos.lon.toFixed(3) + ') is <b>outside every downloaded map area</b>, so the map around it is blank. Use <b>Download</b> below to fetch that area (internet needed now), or the Google Maps link on the dashboard while online.'; }
+  if (!inside){ mo.innerHTML = '📍 ' + esc(name) + '\'s last position (' + pos.lat.toFixed(3) + ', ' + pos.lon.toFixed(3) + ') is <b>outside every downloaded map area</b>, so the map around it is blank. <button class="btn xs primary" onclick="mapDownloadHere()" title="Fetch USGS tiles for 100 km around this position (internet needed now)">⬇️ Download map for this area</button> or use the Google Maps link on the dashboard while online.'; }
   show('mapOutside', !inside);
   $('mapPosInfo').style.display = 'block';
   $('mapPosTitle').textContent = name + ' — ' + src + ' position';
