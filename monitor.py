@@ -16,7 +16,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, request, Response
 
-__version__ = "0.4.2"
+__version__ = "0.4.3"
 UPDATE_REPO = "KK4ODA/HamLink-Radio"   # GitHub repo checked for new releases
 
 # ---------------------------------------------------------------------------
@@ -3361,6 +3361,44 @@ def list_maps():
                     "attribution": meta.get("attribution", "")})
     return out
 
+_map_meta_cache = {}
+
+def active_map_info():
+    """{file, name, bounds:[w,s,e,n], minzoom, maxzoom, attribution} for the
+    map the Offline Map tab will show, or None when no usable file exists."""
+    p = _active_map_path()
+    if not p:
+        return None
+    try:
+        key = (p, os.path.getmtime(p))
+    except OSError:
+        return None
+    if key not in _map_meta_cache:
+        meta = {}
+        try:
+            c = sqlite3.connect(p)
+            meta = dict(c.execute("SELECT name, value FROM metadata").fetchall())
+            c.close()
+        except Exception:
+            pass
+        bounds = None
+        try:
+            b = [float(x) for x in (meta.get("bounds") or "").split(",")]
+            if len(b) == 4:
+                bounds = b
+        except ValueError:
+            pass
+        def _int(v):
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return None
+        _map_meta_cache.clear()
+        _map_meta_cache[key] = {"file": os.path.basename(p), "name": meta.get("name") or os.path.basename(p),
+                                "bounds": bounds, "minzoom": _int(meta.get("minzoom")), "maxzoom": _int(meta.get("maxzoom")),
+                                "attribution": meta.get("attribution", ""), "description": meta.get("description", "")}
+    return _map_meta_cache[key]
+
 def _active_map_path():
     """tiles/<map_file>, or the legacy <state>.mbtiles, or None."""
     with cfglock:
@@ -3954,8 +3992,9 @@ def api_status():
         cfg_snap = copy.deepcopy(config)
     ap = cfg_snap.setdefault("aprs", {})
     ap["traveler_ssids"] = ap.get("traveler_ssids") or ap.get("traveler_ssid", "-7")
-    # Resolve BBS directory outside cfglock to avoid deadlock
+    # Resolve BBS directory and the active map outside cfglock to avoid deadlock
     cfg_snap["bbs_directory_resolved"] = get_bbs_directory() or ""
+    map_active = active_map_info()
     # Now snapshot state under slock (no cfglock held — no deadlock possible)
     with slock:
         for a in state["history"]:
@@ -3994,6 +4033,7 @@ def api_status():
             "app_dir": APP_DIR,
             "tiles_dir": TILES_DIR,
             "config_saved_at": state.get("config_saved_at"),
+            "map_active": map_active,
         })
 
 @app.route("/api/update/status")
@@ -5425,7 +5465,9 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
 .sr-result.err{display:block;background:var(--red-soft);color:var(--red)}
 
 /* ---------- Map ---------- */
-#mapContainer{height:520px;border-radius:var(--radius);overflow:hidden;border:1px solid var(--border);display:none}
+#mapContainer{height:520px;width:100%;border-radius:var(--radius);overflow:hidden;border:1px solid var(--border);display:none;
+  background:repeating-linear-gradient(45deg,var(--surface3) 0 10px,var(--surface2) 10px 20px)}
+.leaflet-container{background:transparent}
 .map-info{margin-top:12px;padding:14px 16px;display:none}
 .map-tools{display:flex;gap:8px;margin-top:10px}
 
@@ -5626,17 +5668,19 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
 <div class="main hidden" id="mapTab">
   <div class="empty" id="mapNoConfig">
     <div class="icon">🗺️</div>
-    <p>No offline map configured.</p>
+    <p id="mapNoConfigText">No offline map downloaded yet.</p>
     <p style="margin-top:6px">Open Settings → Offline map and press <b>Download map</b> for the area around home. It works without internet afterwards.</p>
     <p style="margin-top:10px"><button class="btn sm primary" onclick="openSett()">Open Settings</button></p>
   </div>
   <div id="mapContainer"></div>
+  <div class="notice warn hidden" id="mapOutside" style="margin-top:10px"></div>
   <div class="card map-info" id="mapPosInfo">
     <div style="display:flex;align-items:center;gap:8px"><span style="font-size:18px">📍</span><b id="mapPosTitle"></b></div>
     <div class="loc-time" id="mapPosTime"></div>
     <div class="loc-details" id="mapPosDetails"></div>
-    <div class="map-tools"><button class="btn sm" onclick="centerMap()">Center on position</button></div>
+    <div class="map-tools"><button class="btn sm" onclick="centerMap()" title="Zoom to the traveler's last position">Center on position</button><button class="btn sm" onclick="showMapArea()" title="Zoom out to the whole downloaded area">Show map area</button></div>
   </div>
+  <div class="fhint" id="mapMeta" style="margin-top:8px"></div>
 </div>
 
 <!-- ===================== DASHBOARD TAB ===================== -->
@@ -7050,32 +7094,64 @@ function switchTab(tab){
   if (tab === 'map') initMap();
 }
 let _map = null, _marker = null, _lastMapPos = null;
+let _tileLayer = null, _mapFile = null, _mapBounds = null, _fitDone = false;
+function _activeMap(){ return last && last.map_active ? last.map_active : null; }
+function _boundsOf(ma){
+  const b = ma && ma.bounds; if (!b || b.length !== 4) return null;
+  return L.latLngBounds([[b[1], b[0]], [b[3], b[2]]]);   // metadata bounds are w,s,e,n
+}
 function initMap(){
-  const mapState = last && last.config ? (last.config.map_file || last.config.map_state) : '';
-  show('mapNoConfig', !mapState); $('mapContainer').style.display = mapState ? 'block' : 'none';
-  if (!mapState) return;
+  const ma = _activeMap();
+  const wanted = last && last.config ? (last.config.map_file || last.config.map_state) : '';
+  if (!ma){
+    $('mapNoConfigText').textContent = wanted ? 'The selected map "' + wanted + '" was not found in the tiles folder.' : 'No offline map downloaded yet.';
+    show('mapNoConfig', true); $('mapContainer').style.display = 'none'; show('mapOutside', false); $('mapPosInfo').style.display = 'none'; $('mapMeta').textContent = '';
+    return;
+  }
+  show('mapNoConfig', false); $('mapContainer').style.display = 'block';
   if (!_map){
     L.Icon.Default.imagePath = '/static/';
-    _map = L.map('mapContainer').setView([39.8, -98.5], 5);
-    L.tileLayer('/tiles/{z}/{x}/{y}.png', {maxZoom: 16, minZoom: 3, attribution: 'Offline tiles · USGS The National Map'}).addTo(_map);
+    _map = L.map('mapContainer', {zoomSnap: 0.5}).setView([39.8, -98.5], 4);
+    _tileLayer = L.tileLayer('/tiles/{z}/{x}/{y}.png', {maxZoom: 16, minZoom: 3, maxNativeZoom: ma.maxzoom || 16, attribution: 'Offline tiles · ' + esc(ma.attribution || 'MBTiles')}).addTo(_map);
   }
-  setTimeout(() => _map.invalidateSize(), 100);
-  updateMapPosition();
+  if (ma.file !== _mapFile){   // map changed (or first show): reload tiles, refit
+    _mapFile = ma.file; _mapBounds = _boundsOf(ma); _fitDone = false;
+    _tileLayer.options.maxNativeZoom = ma.maxzoom || 16; _tileLayer.redraw();
+    const km = (ma.description || '').match(/(\d+) km around/);
+    $('mapMeta').textContent = 'Map: ' + ma.file + (km ? ' · ' + km[1] + ' km around home' : '') + (ma.maxzoom ? ' · zoom ' + (ma.minzoom || 3) + '–' + ma.maxzoom : '') + '. Grey areas are outside the downloaded map.';
+  }
+  // The tab was display:none a moment ago, so Leaflet must re-measure before it draws.
+  setTimeout(() => {
+    _map.invalidateSize();
+    if (!_fitDone){
+      _fitDone = true;
+      const {pos} = currentPos(last || {});
+      if (pos && (!_mapBounds || _mapBounds.contains([pos.lat, pos.lon]))) _map.setView([pos.lat, pos.lon], Math.min(10, ma.maxzoom || 10));
+      else if (_mapBounds) _map.fitBounds(_mapBounds);
+    }
+    updateMapPosition();
+  }, 120);
 }
-function centerMap(){ const {pos} = currentPos(last || {}); if (_map && pos) _map.setView([pos.lat, pos.lon], 11); }
+function centerMap(){ const {pos} = currentPos(last || {}); if (_map && pos) _map.setView([pos.lat, pos.lon], Math.min(11, (_activeMap() || {}).maxzoom || 11)); }
+function showMapArea(){ if (_map && _mapBounds) _map.fitBounds(_mapBounds); }
 function updateMapPosition(){
-  if (!_map || !last) return;
+  if (!_map || !last || !_activeMap()) return;
   const {pos, src} = currentPos(last);
-  if (!pos){ $('mapPosInfo').style.display = 'none'; return; }
+  if (!pos){ $('mapPosInfo').style.display = 'none'; show('mapOutside', false); return; }
   const ll = [pos.lat, pos.lon], key = pos.lat.toFixed(5) + ',' + pos.lon.toFixed(5);
   if (_marker) _marker.setLatLng(ll); else _marker = L.marker(ll).addTo(_map);
   const name = last.config.operator_name || pos.callsign || 'Unknown';
   _marker.bindPopup('<b>' + esc(name) + '</b><br>' + src + ' position<br>' + pos.lat.toFixed(4) + ', ' + pos.lon.toFixed(4) + '<br>' + esc(fmtTime(pos.time)));
-  if (key !== _lastMapPos){ _map.setView(ll, 10); _lastMapPos = key; }   // only recenter when the position changes
+  const inside = !_mapBounds || _mapBounds.contains(ll);
+  if (key !== _lastMapPos){ _lastMapPos = key; if (inside) _map.setView(ll, Math.min(10, (_activeMap() || {}).maxzoom || 10)); }   // only recenter when the position changes
+  const mo = $('mapOutside');
+  if (!inside){ mo.innerHTML = '📍 ' + esc(name) + '\'s last position (' + pos.lat.toFixed(3) + ', ' + pos.lon.toFixed(3) + ') is <b>outside the downloaded map area</b>, so the map around it is blank. Download a larger radius in Settings → Offline map, or use the Google Maps link on the dashboard while online.'; }
+  show('mapOutside', !inside);
   $('mapPosInfo').style.display = 'block';
   $('mapPosTitle').textContent = name + ' — ' + src + ' position';
   $('mapPosTime').textContent = fmtTime(pos.time); $('mapPosDetails').textContent = posDetails(pos);
 }
+window.addEventListener('resize', () => { if (_map && currentTab === 'map') _map.invalidateSize(); });
 </script>
 </body>
 </html>"""
