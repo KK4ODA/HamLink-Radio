@@ -73,7 +73,7 @@ The whole application is one Python file, `monitor.py`: a Flask backend with bac
 2. Open **Settings** (⚙️) and fill in *People & callsigns* and the *VarAC database path* (use **Browse**, then **Test**).
 3. Enable APRS, Winlink, Pushover, and the offline map as needed. Every field has a hint.
 
-See **[MANUAL.md](MANUAL.md)** for the complete guide: configuration, use cases, sitreps, troubleshooting, and the FCC compliance section.
+Print **[docs/QUICK_REFERENCE.md](docs/QUICK_REFERENCE.md)** for both people — one page on how to reach each other. See **[MANUAL.md](MANUAL.md)** for the complete guide: configuration, use cases, sitreps, troubleshooting, and the FCC compliance section.
 
 ### Try it without any radio software
 
