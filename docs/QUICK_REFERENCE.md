@@ -5,7 +5,7 @@ Two people, three ways to reach each other. Keep this near the radio and on the 
 | | Home station (Brecken) | Traveler (Facundo) |
 |---|---|---|
 | Station callsign | `KK4ODA` | `KK4ODA/P` (VarAC), `KK4ODA` (Winlink) |
-| APRS address | `KK4ODA-5` | `KK4ODA-9` (primary), `KK4ODA-7` (backup) |
+| APRS address | `KK4ODA-5` | `KK4ODA-9` (add `-7` in Settings → APRS if the handheld is used too) |
 | Winlink address | `BRECKEN` | `FACUNDO` |
 | Winlink RF gateway (no internet) | `WD5EMA-10` via VARA FM | any nearby gateway |
 | Home location | 33.8404, -84.2743 (Atlanta area) | shown on the dashboard when you beacon |
@@ -23,7 +23,7 @@ Pick the first channel that works, top to bottom:
 
 **Check in by APRS** (phone app or APRS radio)
 - Send a message **to `KK4ODA-5`**. Keep it under **67 characters**.
-- Send **from `KK4ODA-9`** (or `KK4ODA-7`); home listens for both.
+- Send **from `KK4ODA-9`** (the mobile). `KK4ODA-7` only works if it is added to *Traveler APRS SSIDs* in Settings.
 - Beacon your position now and then; home sees it on the dashboard and map.
 - You get an ACK back when HamLink receives it. If not, try again or use another channel.
 - No signal? Send anyway. Some iGates and the APRS MAIL bot will hold it.
@@ -85,3 +85,80 @@ Pick the first channel that works, top to bottom:
 - Leave the HamLink window and browser tab open. Tap Start Monitoring after a reboot so alert sounds work.
 - Settings live in `config.json` next to `HamLink_Radio.exe` (the path is shown at the bottom of the page and in Settings).
 - Stop HamLink only from the button at the bottom of the page.
+
+---
+
+## HamLink settings cheat sheet (current values)
+
+Everything below lives in `config.json` next to `HamLink_Radio.exe` (the path is shown at the bottom of the dashboard). Secrets are not listed here — they are in the file and in Settings.
+
+**People & callsigns**
+
+| Setting | Value | Why |
+|---|---|---|
+| Their name | `Facundo` | Shown in alerts and on the Send Message button |
+| Home station callsign | `KK4ODA` | Base call only. VarAC replies come from it; APRS and the beacon add the SSID below |
+| Watch for callsign(s) | `KK4ODA, KK4ODA/P` | VarAC and Winlink senders that trigger alerts (no APRS SSIDs here) |
+
+**VarAC**
+
+| Setting | Value |
+|---|---|
+| Database path | `C:\VarAC\VarAC.db` |
+| Executable path | `C:\VarAC\VarAC.exe` (auto-launched) |
+| Profile (.ini) | `VarAC.ini` |
+| BBS directory override | blank (read from VarAC.ini) |
+| Check every | 15 s |
+
+**Alert sound**: Gentle chime, volume 30 %, alarm stops by itself after 15 min. Quick replies: the four defaults.
+
+**Phone notifications (Pushover)**: enabled, priority High, sound *pushover*, quick-reply links on. Keys are in Settings.
+
+**APRS messaging (APRS-IS)**
+
+| Setting | Value | Why |
+|---|---|---|
+| Enable APRS-IS | **off** | Turn on to receive/send APRS over the internet. RF APRS via Soundmodem works regardless |
+| Home station SSID | `-5` | → home APRS address `KK4ODA-5` |
+| Traveler SSID(s) | `-9` | → traveler address `KK4ODA-9` (add `, -7` for the handheld) |
+| Server / port | `rotate.aprs2.net` / `14580` | |
+| Passcode | set (Auto-generate recreates it) | |
+| RF fallback | on | Send via Soundmodem when internet is down (licensed-operator confirmation) |
+| APRS mailbox copy | on | Also sends replies to the MAIL bot for later pickup |
+| aprs.fi API key | set | Backfills the last position on startup |
+
+**APRS RF monitor (Soundmodem)**
+
+| Setting | Value |
+|---|---|
+| Enable | on |
+| Soundmodem path | `C:\Users\Facundo\Desktop\soundmodem114 -packet D710\soundmodem.exe` |
+| KISS TCP host / port | `127.0.0.1` / `8101` (must match Soundmodem's KISS server port) |
+
+**APRS position beacon**: on, `33.8404, -84.2743`, symbol House, every 30 min, comment *HamLink Radio*, via APRS-IS and via RF.
+
+**VMail relay automation**: on, auto-retrieve on, confirm before connecting **off**, route replies via relay on, cooldown 300 s, delay 10 s, max retries 2, no ignored stations.
+
+**Winlink (via Pat)**
+
+| Setting | Value | Why |
+|---|---|---|
+| Enable | on | |
+| Pat executable | `C:\Pat\pat.exe` (auto-launched) | |
+| Pat HTTP address | `localhost:8080` | |
+| Check Winlink every | 30 s | |
+| Position reports | on | Reads the traveler's Winlink position reports |
+| Winlink callsign | `KK4ODA` | Pat account login (password in Settings) |
+| Home tactical address | `BRECKEN` | Home sends FROM this; Facundo sends TO it |
+| Traveler tactical address | `FACUNDO` | Home sends TO this; alerts for mail FROM it |
+| RF fallback | on | Use the VARA FM gateway when internet is down |
+| VARA FM gateway | `WD5EMA-10` | Callsign **with** SSID, dash not = |
+| RF gateway poll interval | 10800 s (3 h) | |
+| VARA FM executable | `C:\VARA FM_9700\VARAFM.exe` | |
+| VARA FM modem address | `localhost:8200` | |
+
+**Offline map**: maps live in `tiles/` — `home-area.mbtiles` (around home) plus trip maps downloaded from the Map tab. All are shown together.
+
+**Updates**: automatic check every 6 h, no GitHub token needed (the repository is public).
+
+**Web port**: 5000 → `http://127.0.0.1:5000` on the PC, `http://<PC-IP>:5000` from a phone on the home Wi-Fi.
