@@ -267,6 +267,8 @@ HamLink downloads its own map tiles, so the Offline Map tab works with no intern
 | **Map style** | *USGS Topo* (roads, terrain, place names) or *USGS Imagery + Topo* (satellite with labels). |
 | **Name** | File name for the map (`tiles/<name>.mbtiles`). |
 
+**Map around the traveler.** On the Offline Map tab, under the position card, **Download a map around the last position** fetches the area (50/100/200 km) where the traveler was last heard — useful when they move beyond the home map. In Settings, **Use last position** fills the center fields the same way. All downloaded maps are shown together, so the home-area map stays.
+
 The size estimate updates as you change the radius and zoom. Press **Download map**; progress is shown and HamLink keeps working meanwhile. When it finishes, the new map is selected automatically. **Maps on this computer** lists every `.mbtiles` in `tiles/` with **Use** and **Delete** buttons — you can also drop a file made with another tool (MOBAC, QGIS, etc.) into that folder and select it there. Keep total size reasonable: a 150 km radius at zoom 12 is about 2,000 tiles / 45 MB.
 
 ### 5.10 APRS RF Monitor (Soundmodem)

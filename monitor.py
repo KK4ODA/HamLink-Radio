@@ -16,7 +16,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, request, Response
 
-__version__ = "0.4.4"
+__version__ = "0.4.5"
 UPDATE_REPO = "KK4ODA/HamLink-Radio"   # GitHub repo checked for new releases
 
 # ---------------------------------------------------------------------------
@@ -3458,6 +3458,48 @@ def active_map_info():
                                 "attribution": meta.get("attribution", ""), "description": meta.get("description", "")}
     return _map_meta_cache[key]
 
+def _all_map_paths():
+    """Primary map first, then every other .mbtiles in tiles/."""
+    primary = _active_map_path()
+    out = [primary] if primary else []
+    if os.path.isdir(TILES_DIR):
+        for f in sorted(os.listdir(TILES_DIR)):
+            p = os.path.join(TILES_DIR, f)
+            if f.lower().endswith(".mbtiles") and p != primary:
+                out.append(p)
+    return out
+
+def map_coverage():
+    """[{file, bounds:[w,s,e,n], maxzoom}] for every map file (bounds may be None)."""
+    cov = []
+    for m in list_maps():
+        b = None
+        try:
+            v = [float(x) for x in (m.get("bounds") or "").split(",")]
+            if len(v) == 4:
+                b = v
+        except ValueError:
+            pass
+        try:
+            mz = int(m.get("maxzoom") or 0) or None
+        except ValueError:
+            mz = None
+        cov.append({"file": m["file"], "bounds": b, "maxzoom": mz})
+    return cov
+
+_map_cov_cache = {"key": None, "value": []}
+
+def _map_coverage_cached():
+    try:
+        names = tuple(sorted(f for f in os.listdir(TILES_DIR) if f.lower().endswith(".mbtiles"))) if os.path.isdir(TILES_DIR) else ()
+        key = tuple((n, os.path.getmtime(os.path.join(TILES_DIR, n))) for n in names)
+    except OSError:
+        key = None
+    if key != _map_cov_cache["key"]:
+        _map_cov_cache["key"] = key
+        _map_cov_cache["value"] = map_coverage()
+    return _map_cov_cache["value"]
+
 def _active_map_path():
     """tiles/<map_file>, or the legacy <state>.mbtiles, or None."""
     with cfglock:
@@ -3853,47 +3895,37 @@ def api_version():
 # ---------------------------------------------------------------------------
 # MBTiles tile server
 # ---------------------------------------------------------------------------
-_mbtiles_conn = None
-_mbtiles_path = None
-_mbtiles_lock = threading.Lock()  # Flask serves tiles concurrently; sqlite conn is shared
+_mbtiles_conns = {}               # path -> sqlite connection (shared across Flask threads)
+_mbtiles_lock = threading.Lock()  # Flask serves tiles concurrently; sqlite conns are shared
 _EMPTY_TILE = Response(b"", status=204)
 
 @app.route("/tiles/<int:z>/<int:x>/<int:y>.png")
 def serve_tile(z, x, y):
-    """Serve map tiles from a local MBTiles file."""
-    global _mbtiles_conn, _mbtiles_path
-    fpath = _active_map_path()
-    if not fpath:
-        return Response(b"", status=204)
-    # MBTiles uses TMS y-coordinate (flipped from XYZ)
+    """Serve a map tile from the primary MBTiles file, falling back to every
+    other .mbtiles in tiles/ — so a home-area map and a map downloaded around
+    the traveler's position show up together on one Leaflet layer."""
     tms_y = (2 ** z - 1) - y
+    paths = _all_map_paths()
+    if not paths:
+        return Response(b"", status=204)
     with _mbtiles_lock:
-        # Cache connection, reopen if path changed
-        if _mbtiles_path != fpath or _mbtiles_conn is None:
-            if _mbtiles_conn:
+        for p in paths:
+            conn = _mbtiles_conns.get(p)
+            if conn is None:
                 try:
-                    _mbtiles_conn.close()
+                    conn = sqlite3.connect(p, check_same_thread=False)
+                    _mbtiles_conns[p] = conn
                 except Exception:
-                    pass
-                _mbtiles_conn = None
-            if not os.path.isfile(fpath):
-                return Response(b"", status=204)
+                    continue
             try:
-                _mbtiles_conn = sqlite3.connect(fpath, check_same_thread=False)
-                _mbtiles_path = fpath
+                row = conn.execute("SELECT tile_data FROM tiles WHERE zoom_level=? AND tile_column=? AND tile_row=?",
+                                   (z, x, tms_y)).fetchone()
             except Exception:
-                return Response(b"", status=204)
-        try:
-            cur = _mbtiles_conn.cursor()
-            cur.execute("SELECT tile_data FROM tiles WHERE zoom_level=? AND tile_column=? AND tile_row=?",
-                        (z, x, tms_y))
-            row = cur.fetchone()
+                continue
             if row:
                 data = bytes(row[0])
                 mt = "image/png" if data[:4] == b"\x89PNG" else "image/jpeg"
                 return Response(data, mimetype=mt)
-        except Exception:
-            pass
     return Response(b"", status=204)
 
 @app.route("/api/map/list")
@@ -3953,15 +3985,13 @@ def api_map_delete():
     p = os.path.join(TILES_DIR, f)
     if not f.lower().endswith(".mbtiles") or not os.path.isfile(p):
         return jsonify({"ok": False, "error": "File not found"})
-    global _mbtiles_conn, _mbtiles_path
     with _mbtiles_lock:
-        if _mbtiles_path == p and _mbtiles_conn:
+        conn = _mbtiles_conns.pop(p, None)
+        if conn:
             try:
-                _mbtiles_conn.close()
+                conn.close()
             except Exception:
                 pass
-            _mbtiles_conn = None
-            _mbtiles_path = None
     try:
         os.remove(p)
     except OSError as e:
@@ -4054,6 +4084,7 @@ def api_status():
     # Resolve BBS directory and the active map outside cfglock to avoid deadlock
     cfg_snap["bbs_directory_resolved"] = get_bbs_directory() or ""
     map_active = active_map_info()
+    map_cov = _map_coverage_cached()
     # Now snapshot state under slock (no cfglock held — no deadlock possible)
     with slock:
         for a in state["history"]:
@@ -4094,6 +4125,7 @@ def api_status():
             "tiles_dir": TILES_DIR,
             "config_saved_at": state.get("config_saved_at"),
             "map_active": map_active,
+            "map_coverage": map_cov,
         })
 
 @app.route("/api/update/status")
@@ -5731,6 +5763,21 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
   </div>
   <div id="mapContainer"></div>
   <div class="notice warn hidden" id="mapOutside" style="margin-top:10px"></div>
+  <div class="card map-info" id="mapDlCard" style="display:none;margin-top:10px">
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+      <b>Download a map around the last position</b>
+      <select class="fsel" id="mapDlRadius" style="width:auto" title="How far around the traveler's last position to download">
+        <option value="50">50 km</option><option value="100" selected>100 km</option><option value="200">200 km</option>
+      </select>
+      <select class="fsel" id="mapDlZoom" style="width:auto" title="Detail level">
+        <option value="11">towns &amp; highways</option><option value="12" selected>roads</option><option value="13">streets</option>
+      </select>
+      <button class="btn sm primary" id="mapDlHereBtn" onclick="mapDownloadHere()" title="Fetch USGS tiles for this area and add them to the offline map">⬇️ Download</button>
+      <span class="fhint" id="mapDlHereStatus"></span>
+    </div>
+    <div class="progress hidden" id="mapDlHereProgress"><i></i></div>
+    <div class="fhint" style="margin-top:6px">Needs internet now; the map then works offline. Downloaded areas are combined, so the home map stays.</div>
+  </div>
   <div class="card map-info" id="mapPosInfo">
     <div style="display:flex;align-items:center;gap:8px"><span style="font-size:18px">📍</span><b id="mapPosTitle"></b></div>
     <div class="loc-time" id="mapPosTime"></div>
@@ -6122,7 +6169,8 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
           <div class="fhint" style="margin-bottom:10px">HamLink downloads map tiles from the USGS National Map (US public domain) and keeps them in the <code>tiles/</code> folder, so the map works with no internet. Pick the area around home and press Download.</div>
           <div class="subhead" style="margin-top:0;padding-top:0;border:none">Download a map area</div>
           <div class="fg"><label class="fl">Center (latitude / longitude)</label>
-            <div class="frow"><input class="fi" id="cMapLat" type="number" step="0.0001" placeholder="33.7490" title="Latitude of the center of the map area"><input class="fi" id="cMapLon" type="number" step="0.0001" placeholder="-84.3880" title="Longitude of the center of the map area"><button class="btn sm" onclick="mapUseBeacon()" title="Copy the coordinates from the Position beacon section">Use home position</button></div></div>
+            <div class="frow"><input class="fi" id="cMapLat" type="number" step="0.0001" placeholder="33.7490" title="Latitude of the center of the map area"><input class="fi" id="cMapLon" type="number" step="0.0001" placeholder="-84.3880" title="Longitude of the center of the map area"><button class="btn sm" onclick="mapUseBeacon()" title="Copy the coordinates from the Position beacon section">Use home position</button><button class="btn sm" onclick="mapUseLastPos()" title="Copy the traveler's last known position from the dashboard">Use last position</button></div>
+            <div class="fhint">Every downloaded map is shown together on the Offline Map tab, so you can keep a home-area map and add areas along the trip.</div></div>
           <div class="fg"><label class="fl">Radius around center (km)</label><input class="fi w-xs" id="cMapRadius" type="number" min="5" max="600" value="150" oninput="mapEstimate()" title="How far from the center the map should extend. 150 km covers a typical day's drive."></div>
           <div class="fg"><label class="fl">Detail (max zoom)</label>
             <select class="fsel w-md" id="cMapZoom" onchange="mapEstimate()" title="Higher zoom = more street detail but many more tiles to download">
@@ -6942,6 +6990,39 @@ function mapUseBeacon(){
   if (!la || !lo){ toast('Set the home position in the Position beacon section first (or use 📍 Detect there)', true); return; }
   $('cMapLat').value = la; $('cMapLon').value = lo; mapEstimate();
 }
+function mapUseLastPos(){
+  const {pos} = currentPos(last || {});
+  if (!pos){ toast('No position received from the traveler yet', true); return; }
+  $('cMapLat').value = pos.lat.toFixed(4); $('cMapLon').value = pos.lon.toFixed(4);
+  if (!val('cMapName') || val('cMapName') === 'home-area') $('cMapName').value = 'trip-' + new Date().toISOString().slice(0, 10);
+  mapEstimate();
+}
+let _mapHerePoll = null;
+async function mapDownloadHere(){
+  const {pos} = currentPos(last || {});
+  if (!pos){ toast('No position received from the traveler yet', true); return; }
+  const radius = parseInt($('mapDlRadius').value), zoom = parseInt($('mapDlZoom').value);
+  const name = 'trip-' + new Date().toISOString().slice(0, 10) + '-' + pos.lat.toFixed(1) + '_' + pos.lon.toFixed(1);
+  try {
+    const r = await cpost('/api/map/download', {name, lat: pos.lat, lon: pos.lon, radius_km: radius, min_zoom: 5, max_zoom: zoom, source: 'usgs_topo'});
+    const d = await r.json();
+    if (!d.ok){ toast(d.error || 'Could not start download', true); return; }
+  } catch(e){ toast('Download failed: ' + e, true); return; }
+  $('mapDlHereBtn').disabled = true; show('mapDlHereProgress', true); $('mapDlHereStatus').textContent = 'Starting…';
+  if (!_mapHerePoll) _mapHerePoll = setInterval(mapHerePoll, 1000);
+}
+async function mapHerePoll(){
+  try {
+    const r = await fetch('/api/map/status'); const s = await r.json();
+    const pct = s.total ? Math.round(s.done * 100 / s.total) : 0;
+    $('mapDlHereProgress').firstElementChild.style.width = pct + '%';
+    if (s.running){ $('mapDlHereStatus').textContent = s.done.toLocaleString() + ' / ' + s.total.toLocaleString() + ' tiles (' + pct + '%)'; return; }
+    clearInterval(_mapHerePoll); _mapHerePoll = null; $('mapDlHereBtn').disabled = false; show('mapDlHereProgress', false);
+    if (s.error){ $('mapDlHereStatus').textContent = s.error; return; }
+    $('mapDlHereStatus').textContent = '✓ ' + s.file + ' added.'; toast('Map ready: ' + s.file);
+    await poll(); if (_tileLayer) _tileLayer.redraw(); _fitDone = false; initMap();
+  } catch(e){}
+}
 async function mapEstimate(){
   const lat = parseFloat($('cMapLat').value), lon = parseFloat($('cMapLon').value);
   if (isNaN(lat) || isNaN(lon)){ $('mapEst').textContent = 'Enter a center point to see the download size.'; return; }
@@ -7175,6 +7256,7 @@ function initMap(){
   if (!ma){
     $('mapNoConfigText').textContent = wanted ? 'The selected map "' + wanted + '" was not found in the tiles folder.' : 'No offline map downloaded yet.';
     show('mapNoConfig', true); $('mapContainer').style.display = 'none'; show('mapOutside', false); $('mapPosInfo').style.display = 'none'; $('mapMeta').textContent = '';
+    $('mapDlCard').style.display = currentPos(last || {}).pos ? 'block' : 'none';
     return;
   }
   show('mapNoConfig', false); $('mapContainer').style.display = 'block';
@@ -7206,15 +7288,17 @@ function showMapArea(){ if (_map && _mapBounds) _map.fitBounds(_mapBounds); }
 function updateMapPosition(){
   if (!_map || !last || !_activeMap()) return;
   const {pos, src} = currentPos(last);
-  if (!pos){ $('mapPosInfo').style.display = 'none'; show('mapOutside', false); return; }
+  if (!pos){ $('mapPosInfo').style.display = 'none'; show('mapOutside', false); $('mapDlCard').style.display = 'none'; return; }
+  $('mapDlCard').style.display = 'block';
   const ll = [pos.lat, pos.lon], key = pos.lat.toFixed(5) + ',' + pos.lon.toFixed(5);
   if (_marker) _marker.setLatLng(ll); else _marker = L.marker(ll).addTo(_map);
   const name = last.config.operator_name || pos.callsign || 'Unknown';
   _marker.bindPopup('<b>' + esc(name) + '</b><br>' + src + ' position<br>' + pos.lat.toFixed(4) + ', ' + pos.lon.toFixed(4) + '<br>' + esc(fmtTime(pos.time)));
-  const inside = !_mapBounds || _mapBounds.contains(ll);
+  const covs = (last.map_coverage || []).map(c => c.bounds).filter(b => b && b.length === 4).map(b => L.latLngBounds([[b[1], b[0]], [b[3], b[2]]]));
+  const inside = covs.length === 0 ? (!_mapBounds || _mapBounds.contains(ll)) : covs.some(b => b.contains(ll));
   if (key !== _lastMapPos){ _lastMapPos = key; if (inside) _map.setView(ll, Math.min(10, (_activeMap() || {}).maxzoom || 10)); }   // only recenter when the position changes
   const mo = $('mapOutside');
-  if (!inside){ mo.innerHTML = '📍 ' + esc(name) + '\'s last position (' + pos.lat.toFixed(3) + ', ' + pos.lon.toFixed(3) + ') is <b>outside the downloaded map area</b>, so the map around it is blank. Download a larger radius in Settings → Offline map, or use the Google Maps link on the dashboard while online.'; }
+  if (!inside){ mo.innerHTML = '📍 ' + esc(name) + '\'s last position (' + pos.lat.toFixed(3) + ', ' + pos.lon.toFixed(3) + ') is <b>outside every downloaded map area</b>, so the map around it is blank. Use <b>Download</b> below to fetch that area (internet needed now), or the Google Maps link on the dashboard while online.'; }
   show('mapOutside', !inside);
   $('mapPosInfo').style.display = 'block';
   $('mapPosTitle').textContent = name + ' — ' + src + ' position';
