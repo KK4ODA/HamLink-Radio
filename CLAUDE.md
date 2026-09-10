@@ -146,7 +146,7 @@ HamLink Radio is a family emergency communications app for licensed amateur radi
 - **Job 2 (windows):** PyInstaller `--onefile --add-data static;static --collect-all comtypes` → `HamLink-Radio-vX.Y.Z-win64.zip` (exe + README + MANUAL + tiles/README) uploaded to the same release.
 - **Process:** bump `__version__`, commit, then `git tag -a v0.3.0 -m "v0.3.0" && git push origin v0.3.0`.
 - **Tip:** Use `feat:` / `fix:` / `docs:` prefixes in commit messages so the changelog auto-organises.
-- **History:** v0.1.0 (initial after HomeLink rebrand), v0.2.0 (UI redesign, bug fixes, demo mode, exe in CI), v0.3.0 (self-update), v0.3.1 (fix exe relaunch after update: strip _MEIPASS2/_PYI_* env before spawning the restart helper), v0.3.2 (exe opens the browser on start; --no-browser suppresses), v0.4.0 (settings tests/validation/save confirmation, built-in USGS map downloader, tooltips), v0.4.1 (callsign guidance + live address preview in Settings).
+- **History:** v0.1.0 (initial after HomeLink rebrand), v0.2.0 (UI redesign, bug fixes, demo mode, exe in CI), v0.3.0 (self-update), v0.3.1 (fix exe relaunch after update: strip _MEIPASS2/_PYI_* env before spawning the restart helper), v0.3.2 (exe opens the browser on start; --no-browser suppresses), v0.4.0 (settings tests/validation/save confirmation, built-in USGS map downloader, tooltips), v0.4.1 (callsign guidance + live address preview in Settings), v0.4.2 (Silence alarm / Mark all as read buttons in the hero, silence button on the start splash, alarm_timeout_minutes auto-stop).
 
 ## File Structure
 

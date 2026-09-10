@@ -16,7 +16,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, request, Response
 
-__version__ = "0.4.1"
+__version__ = "0.4.2"
 UPDATE_REPO = "KK4ODA/HamLink-Radio"   # GitHub repo checked for new releases
 
 # ---------------------------------------------------------------------------
@@ -68,10 +68,28 @@ def _beep_system():
     except Exception as e:
         log.warning("System beep failed: %s", e)
 
+_speaker_alarm_started = 0.0
+
+def _alarm_timeout_seconds():
+    """0 = ring until dismissed; otherwise stop by itself after N minutes."""
+    with cfglock:
+        m = config.get("alarm_timeout_minutes", 15)
+    try:
+        return max(0, float(m)) * 60
+    except (TypeError, ValueError):
+        return 15 * 60
+
 def _speaker_alarm_loop():
     """Background loop that beeps every 8 seconds while alarm is active."""
     global _speaker_alarm_active
     while _speaker_alarm_active:
+        limit = _alarm_timeout_seconds()
+        if limit and time.time() - _speaker_alarm_started > limit:
+            log.info("Local speaker alarm auto-stopped after %d min (alarm_timeout_minutes)", int(limit // 60))
+            _speaker_alarm_active = False
+            with slock:
+                state["alarm_silenced"] = True
+            return
         _beep_system()
         for _ in range(80):  # 8 seconds in 0.1s increments, check flag
             if not _speaker_alarm_active:
@@ -79,10 +97,11 @@ def _speaker_alarm_loop():
             time.sleep(0.1)
 
 def start_speaker_alarm():
-    global _speaker_alarm_active, _speaker_alarm_thread
+    global _speaker_alarm_active, _speaker_alarm_thread, _speaker_alarm_started
     # Reset silenced flag — new alert means alarm should sound again
     with slock:
         state["alarm_silenced"] = False
+    _speaker_alarm_started = time.time()
     if _speaker_alarm_active:
         return
     _speaker_alarm_active = True
@@ -224,6 +243,7 @@ DEFAULT_CONFIG = {
     "updates": {"auto_check": True, "interval_hours": 6, "github_token": ""},
     "alert_sound": "gentle",
     "alert_volume": 0.3,
+    "alarm_timeout_minutes": 15,   # PC speaker + browser alarm stop by themselves after this (0 = never)
     "quick_replies": [
         "Got your message, all is well here!",
         "Please check in again soon.",
@@ -4525,7 +4545,7 @@ def api_set_config():
         for k in ["varac_db_path", "varac_exe_path", "varac_profile",
                    "bbs_directory",
                    "poll_interval_seconds", "watch_callsigns",
-                   "alert_sound", "alert_volume", "operator_name", "home_callsign",
+                   "alert_sound", "alert_volume", "alarm_timeout_minutes", "operator_name", "home_callsign",
                    "quick_replies", "map_state", "map_file"]:
             if k in d:
                 config[k] = d[k]
@@ -5202,6 +5222,10 @@ a{color:var(--accent)}
 .hero.alert{background:var(--red-soft);border-color:var(--red);animation:pulse-border 2s ease-in-out infinite}
 .hero.alert .hero-title{color:var(--red)}
 @keyframes pulse-border{0%,100%{box-shadow:0 0 0 0 rgba(220,38,38,.25)}50%{box-shadow:0 0 0 12px rgba(220,38,38,0)}}
+.hero-actions{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin-top:16px}
+.hero-actions .btn{font-size:15px;padding:12px 22px}
+.hero-actions .btn.danger{background:var(--red);color:#fff;border-color:var(--red)}
+.hero-actions .btn.danger:hover{background:var(--red-h);border-color:var(--red-h)}
 .pills{display:flex;flex-wrap:wrap;gap:6px;justify-content:center;margin-top:18px}
 .pill{display:inline-flex;align-items:center;gap:7px;font-size:12px;font-weight:600;color:var(--text2);
   background:var(--surface);border:1px solid var(--border);border-radius:999px;padding:5px 11px 5px 9px}
@@ -5542,6 +5566,10 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
     <p>This app watches for check-in messages from your loved one who is traveling. You'll be alerted when they check in, and you can reply and post family status reports.</p>
     <button class="btn green big" style="max-width:280px" onclick="start()">Start Monitoring</button>
     <div class="fhint" style="margin-top:12px">Tap Start to enable alert sounds in this browser.</div>
+    <div class="hidden" id="splashAlarm" style="margin-top:18px">
+      <div class="notice danger" style="display:inline-block;text-align:left">📨 <b id="splashAlarmText">A message is waiting and the PC alarm is sounding.</b><br>Tap Start to see it, or silence the alarm first.</div><br>
+      <button class="btn danger" style="margin-top:10px" onclick="silenceFromSplash()" title="Stop the PC speaker alarm now">🔕 Silence alarm</button>
+    </div>
   </div>
 </div>
 
@@ -5619,6 +5647,10 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
     <div class="hero-icon" id="statusIcon">📻</div>
     <div class="hero-title" id="statusTitle">Waiting for check-in…</div>
     <div class="hero-sub" id="statusSub">The monitor is watching for messages.</div>
+    <div class="hero-actions hidden" id="heroActions">
+      <button class="btn danger" id="btnSilence" onclick="silenceAll()" title="Stop the sound on this PC and in this browser. Messages stay listed below so you can still reply.">🔕 Silence alarm</button>
+      <button class="btn" id="btnCloseAll" onclick="closeAll()" title="Mark every new message as seen and move them to Previous Messages">✓ Mark all as read</button>
+    </div>
     <div class="pills" id="pills">
       <span class="pill" id="pillInet" title="Internet connectivity, checked every poll. When it is down, APRS and Winlink can fall back to radio."><i class="dot" id="inetDot"></i><span id="inetText">Internet</span></span>
       <span class="pill" id="pillDb" title="Connection to the VarAC database (VarAC.db). Green = VMails are being monitored."><i class="dot" id="connDot"></i><span id="connText">VarAC</span></span>
@@ -5813,6 +5845,8 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
             </select></div>
           <div class="fg"><label class="fl">Volume: <span id="volL">30%</span></label>
             <input type="range" id="cVol" min="0" max="100" value="30" oninput="document.getElementById('volL').textContent=this.value+'%'"></div>
+          <div class="fg"><label class="fl">Stop the alarm by itself after (minutes)</label><input class="fi w-xs" id="cAlarmTimeout" type="number" min="0" max="720" value="15">
+            <div class="fhint">The PC speaker beep and the browser sound repeat until you press <b>Silence alarm</b>, <b>Dismiss</b>, or reply — or until this many minutes have passed. 0 = never stop on its own. Messages stay on the dashboard either way.</div></div>
           <div class="fg"><button class="btn sm" onclick="preview()">▶ Preview</button></div>
           <div class="subhead">Quick replies</div>
           <div class="fg"><label class="fl">Pre-written messages (one per line)</label>
@@ -6085,6 +6119,7 @@ function acceptCompliance(){
   if (!(compChecked[1] && compChecked[2] && compChecked[3])) return;
   try { localStorage.setItem('hamlink_compliance_accepted', '1'); } catch(e){}
   show('complianceScreen', false); show('splash', !soundOn);
+  if (!soundOn) splashPeek();
 }
 function showCompliance(){
   closeSett();
@@ -6096,6 +6131,18 @@ function showCompliance(){
   if (ok){ show('complianceScreen', false); show('splash', true); }
 })();
 
+/* Before Start is tapped nothing polls, so peek once: if messages are already
+   pending (the PC speaker may be beeping) offer a Silence button on the splash. */
+async function splashPeek(){
+  try {
+    const r = await fetch('/api/status'); const d = await r.json();
+    if (d.csrf_token) csrfToken = d.csrf_token;
+    const n = (d.pending || []).length;
+    if (n > 0){ $('splashAlarmText').textContent = n === 1 ? 'A message is waiting' + (d.alarm_silenced ? '.' : ' and the PC alarm is sounding.') : n + ' messages are waiting' + (d.alarm_silenced ? '.' : ' and the PC alarm is sounding.'); show('splashAlarm', true); }
+  } catch(e){}
+}
+function silenceFromSplash(){ cpost('/api/stop_alarm').then(() => { toast('Alarm silenced'); $('splashAlarmText').textContent = 'Alarm silenced. Tap Start to read the message.'; }); }
+if (!$('splash').classList.contains('hidden')) splashPeek();
 function start(){
   try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch(e){}
   soundOn = true; show('splash', false);
@@ -6140,12 +6187,18 @@ function play(type, v, fromName){
   };
   (S[type] || S.gentle)();
 }
+let _alarmStarted = 0;
 function startAlarm(fromName){
   if (fromName) _lastAlertName = fromName;
   if (alarmInt) return;
   const s = cfg.alert_sound || 'gentle';
+  _alarmStarted = Date.now();
   play(s, undefined, fromName);
-  alarmInt = setInterval(() => play(s, undefined, fromName), s === 'voice' ? 8000 : 5000);
+  alarmInt = setInterval(() => {
+    const limit = (typeof cfg.alarm_timeout_minutes === 'number' ? cfg.alarm_timeout_minutes : 15) * 60000;
+    if (limit > 0 && Date.now() - _alarmStarted > limit){ silenceAll(); return; }   // stop by itself, like the PC speaker does
+    play(s, undefined, fromName);
+  }, s === 'voice' ? 8000 : 5000);
 }
 function stopAlarm(){
   if (alarmInt){ clearInterval(alarmInt); alarmInt = null; }
@@ -6384,7 +6437,10 @@ function _updateInfoLine(u){
 function render(){
   const d = last; if (!d) return;
   const alerting = d.pending.filter(a => !dismissedIds.has(a.id));
-  if (alerting.length > 0 && !d.alarm_silenced) startAlarm(alerting[alerting.length - 1].from_name || ''); else stopAlarm();
+  const ringing = alerting.length > 0 && !d.alarm_silenced;
+  if (ringing) startAlarm(alerting[alerting.length - 1].from_name || ''); else stopAlarm();
+  show('heroActions', d.pending.length > 0); show('btnSilence', ringing);
+  $('btnCloseAll').textContent = d.pending.length > 1 ? '✓ Mark all ' + d.pending.length + ' as read' : '✓ Mark as read';
 
   const active = [...d.pending].reverse();
   const cnt = $('activeCount'); cnt.textContent = active.length; show('activeCount', active.length > 0);
@@ -6484,13 +6540,21 @@ function relayAction(url, body, okMsg){
     .catch(e => toast('Relay error: ' + e, true));
 }
 
-function _afterLocalChange(){
-  const d = last; if (!d) return;
-  if (d.pending.filter(a => !dismissedIds.has(a.id)).length === 0){ stopAlarm(); cpost('/api/stop_alarm'); }
+/* Silence = stop the browser sound AND the PC speaker, everywhere, right now.
+   Messages stay in "New Messages" so they can still be read and answered. */
+function silenceAll(){
+  stopAlarm();
+  if (last) last.alarm_silenced = true;   // so the next render() doesn't restart it before the poll catches up
+  cpost('/api/stop_alarm');
   render();
 }
-function dismiss(id){ dismissedIds.add(id); _afterLocalChange(); }        // soft: silence, keep in New Messages
-function dismissAll(){ if (last) last.pending.forEach(a => dismissedIds.add(a.id)); _afterLocalChange(); }
+function _afterLocalChange(){ silenceAll(); }
+function dismiss(id){ dismissedIds.add(id); silenceAll(); }              // soft: silence, keep in New Messages
+function dismissAll(){ if (last) last.pending.forEach(a => dismissedIds.add(a.id)); silenceAll(); }
+function closeAll(){                                                    // hard: acknowledge everything server-side
+  if (last){ last.pending.forEach(a => dismissedIds.add(a.id)); last.pending = []; }
+  cpost('/api/acknowledge_all'); silenceAll();
+}
 function closeMessage(id){                                                // hard: acknowledge server-side
   dismissedIds.add(id); cpost('/api/acknowledge', {id});
   if (last) last.pending = last.pending.filter(a => a.id !== id);
@@ -6656,6 +6720,7 @@ async function fillForm(){
   $('cDb').value = c.varac_db_path || ''; $('cPoll').value = c.poll_interval_seconds || 15;
   $('cSound').value = c.alert_sound || 'gentle';
   const vp = Math.round((typeof c.alert_volume === 'number' ? c.alert_volume : 0.3) * 100); $('cVol').value = vp; $('volL').textContent = vp + '%';
+  $('cAlarmTimeout').value = typeof c.alarm_timeout_minutes === 'number' ? c.alarm_timeout_minutes : 15;
   $('cQuick').value = (c.quick_replies || []).join('\n');
   const po = c.pushover || {};
   setOn('cPoOn', po.enabled); $('cPoUser').value = po.user_key || ''; $('cPoToken').value = po.api_token || '';
@@ -6699,7 +6764,7 @@ async function saveSett(){
     operator_name: val('cName'), home_callsign: val('cHomeCall').toUpperCase(),
     watch_callsigns: val('cWatch').split(',').map(s => s.trim().toUpperCase()).filter(Boolean),
     varac_exe_path: val('cVaracExe'), varac_profile: val('cVaracProfile'), bbs_directory: val('cBbsDir'), varac_db_path: val('cDb'),
-    poll_interval_seconds: num('cPoll', 15), alert_sound: $('cSound').value, alert_volume: num('cVol', 30) / 100,
+    poll_interval_seconds: num('cPoll', 15), alert_sound: $('cSound').value, alert_volume: num('cVol', 30) / 100, alarm_timeout_minutes: num('cAlarmTimeout', 15),
     quick_replies: $('cQuick').value.split('\n').map(s => s.trim()).filter(Boolean),
     pushover: {enabled: isOn('cPoOn'), user_key: val('cPoUser'), api_token: val('cPoToken'), priority: num('cPoPri', 1), sound: $('cPoSnd').value, quick_replies: isOn('cPoQuickReplies')},
     aprs: {enabled: isOn('cAprsOn'), home_ssid: val('cAprsSsid') || '-5', traveler_ssids: val('cAprsTravSsid') || '-7', passcode: val('cAprsPass'),

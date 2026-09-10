@@ -319,7 +319,17 @@ Each alert shows:
 - Time received
 - Channel (VarAC, APRS, Winlink, or Relay)
 
-Tap "Got it" to acknowledge and move to history. Tap "Reply" to respond.
+**Stopping the sound.** The alarm has two parts: the PC speaker beep (comes from HamLink itself, even with the browser closed) and the browser sound or voice. Any of these stops both:
+
+- **🔕 Silence alarm** — the big red button in the status card at the top. Stops the sound everywhere; the messages stay in *New Messages* so you can still read and reply.
+- **Dismiss alert** on any message card — same effect.
+- **Reply** — sending a reply silences the alarm.
+- The **Dismiss** link in the phone notification.
+- If the Start screen is showing when a message arrives, it offers a **Silence alarm** button too.
+
+The alarm also stops on its own after the number of minutes set in Settings → Alert sound (default 15; 0 = never). A new message starts it again.
+
+**Filing messages.** **Close** on a card (or **✓ Mark all as read** in the status card) acknowledges it and moves it to *Previous Messages*. **Reply** answers it on the same channel.
 
 ### 6.3 Sending Messages
 
