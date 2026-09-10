@@ -16,7 +16,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, request, Response
 
-__version__ = "0.4.7"
+__version__ = "0.4.8"
 UPDATE_REPO = "KK4ODA/HamLink-Radio"   # GitHub repo checked for new releases
 
 # ---------------------------------------------------------------------------
@@ -5307,7 +5307,7 @@ a{color:var(--accent)}
 .btn.icon{width:38px;height:38px;padding:0;border-radius:10px;font-size:17px}
 
 /* ---------- Header ---------- */
-.header{position:sticky;top:0;z-index:100;background:var(--surface);border-bottom:1px solid var(--border);
+.header{position:sticky;top:0;z-index:1100;background:var(--surface);border-bottom:1px solid var(--border);
   box-shadow:var(--shadow)}
 .header-inner{max-width:720px;margin:0 auto;padding:12px 16px;display:flex;align-items:center;gap:12px}
 .brand{display:flex;align-items:center;gap:12px;min-width:0;flex:1}
@@ -5553,7 +5553,7 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
 .sr-result.err{display:block;background:var(--red-soft);color:var(--red)}
 
 /* ---------- Map ---------- */
-#mapContainer{height:520px;width:100%;border-radius:var(--radius);overflow:hidden;border:1px solid var(--border);display:none;
+#mapContainer{height:520px;width:100%;border-radius:var(--radius);overflow:hidden;border:1px solid var(--border);display:none;position:relative;z-index:0;isolation:isolate;
   background:repeating-linear-gradient(45deg,var(--surface3) 0 10px,var(--surface2) 10px 20px)}
 .leaflet-container{background:transparent}
 .map-info{margin-top:12px;padding:14px 16px;display:none}
