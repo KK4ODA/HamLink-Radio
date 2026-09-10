@@ -325,7 +325,10 @@ Each alert shows:
 - **Dismiss alert** on any message card — same effect.
 - **Reply** — sending a reply silences the alarm.
 - The **Dismiss** link in the phone notification.
+- The **🔔 bell** button in the header, on every screen. It turns red (🔕) while an alarm is sounding; pressing it when nothing is ringing tells you so — in that case the sound you hear is coming from VarAC, Pat, or another open HamLink tab (reload that tab).
+- The **Esc** key.
 - If the Start screen is showing when a message arrives, it offers a **Silence alarm** button too.
+- **Windows popup**: when the PC speaker starts, a small *HamLink Radio — new message* box appears on the desktop even if no browser is open. **No** silences; **Yes** silences and opens the dashboard.
 
 The alarm also stops on its own after the number of minutes set in Settings → Alert sound (default 15; 0 = never). A new message starts it again.
 

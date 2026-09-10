@@ -16,7 +16,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, request, Response
 
-__version__ = "0.4.3"
+__version__ = "0.4.4"
 UPDATE_REPO = "KK4ODA/HamLink-Radio"   # GitHub repo checked for new releases
 
 # ---------------------------------------------------------------------------
@@ -96,24 +96,79 @@ def _speaker_alarm_loop():
                 return
             time.sleep(0.1)
 
-def start_speaker_alarm():
+_ALARM_POPUP_TITLE = "HamLink Radio — new message"
+_alarm_popup_open = False
+
+def _alarm_popup(summary):
+    """Native Windows message box so the alarm can be silenced even when no
+    browser is open. YES opens the dashboard, NO just silences. Runs in its
+    own thread; closed automatically when the alarm stops another way."""
+    global _alarm_popup_open
+    if sys.platform != "win32" or _alarm_popup_open or DEMO_MODE:
+        return
+    _alarm_popup_open = True
+    def _run():
+        global _alarm_popup_open
+        try:
+            import ctypes
+            with cfglock:
+                port = int(config.get("web_port", 5000))
+            text = (f"{summary or 'A new message has arrived'}.\n\n"
+                    "The alarm keeps sounding until it is silenced.\n\n"
+                    "YES — open the HamLink dashboard (and silence)\n"
+                    "NO — just silence the alarm")
+            MB_YESNO, MB_ICONINFORMATION, MB_TOPMOST, MB_SETFOREGROUND = 0x4, 0x40, 0x40000, 0x10000
+            r = ctypes.windll.user32.MessageBoxW(None, text, _ALARM_POPUP_TITLE,
+                                                 MB_YESNO | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND)
+            if r in (6, 7):   # IDYES / IDNO — either way the user wants quiet
+                stop_speaker_alarm(silence=True)
+                if r == 6:
+                    try:
+                        webbrowser.open(f"http://127.0.0.1:{port}")
+                    except Exception:
+                        pass
+        except Exception as e:
+            log.debug("Alarm popup failed: %s", e)
+        finally:
+            _alarm_popup_open = False
+    threading.Thread(target=_run, daemon=True).start()
+
+def _close_alarm_popup():
+    if sys.platform != "win32" or not _alarm_popup_open:
+        return
+    try:
+        import ctypes
+        hwnd = ctypes.windll.user32.FindWindowW(None, _ALARM_POPUP_TITLE)
+        if hwnd:
+            ctypes.windll.user32.PostMessageW(hwnd, 0x0010, 0, 0)   # WM_CLOSE
+    except Exception:
+        pass
+
+def start_speaker_alarm(summary=""):
     global _speaker_alarm_active, _speaker_alarm_thread, _speaker_alarm_started
     # Reset silenced flag — new alert means alarm should sound again
     with slock:
         state["alarm_silenced"] = False
     _speaker_alarm_started = time.time()
+    _alarm_popup(summary)
     if _speaker_alarm_active:
         return
     _speaker_alarm_active = True
     _speaker_alarm_thread = threading.Thread(target=_speaker_alarm_loop, daemon=True)
     _speaker_alarm_thread.start()
-    log.info("Local speaker alarm STARTED")
+    log.info("Local speaker alarm STARTED — silence it from the dashboard, the popup, or the phone link")
 
-def stop_speaker_alarm():
+def stop_speaker_alarm(silence=False):
+    """Stop the PC beep. silence=True also marks the alarm silenced so the
+    browser sound stops and nothing restarts until a NEW message arrives."""
     global _speaker_alarm_active
     if _speaker_alarm_active:
         _speaker_alarm_active = False
         log.info("Local speaker alarm STOPPED")
+    if silence:
+        with slock:
+            state["alarm_silenced"] = True
+    _close_alarm_popup()
 
 # ---------------------------------------------------------------------------
 # Persistent message log (survives restarts)
@@ -610,7 +665,7 @@ def _process_aprs_packet(packet):
 
             log.info("APRS MSG from %s: %s", from_call, msg_text[:60])
             log_message(alert, "incoming")
-            start_speaker_alarm()
+            start_speaker_alarm(f"APRS message from {opname or from_call}: {msg_text[:80]}")
             send_pushover(f"APRS from {opname}", msg_text, reply_channel="aprs")
 
     except Exception as e:
@@ -2029,7 +2084,7 @@ def _pat_check_inbox():
 
             log.info("Winlink ALERT created: %s from %s", subject[:40], from_addr)
             log_message(alert, "incoming")
-            start_speaker_alarm()
+            start_speaker_alarm(f"Winlink message from {name}: {subject[:60]}")
             send_pushover(f"Winlink from {name}", f"{subject}\n{body_text[:200]}", reply_channel="winlink")
 
         if seen_dirty:
@@ -2899,7 +2954,11 @@ def poll_once():
                 log_message(a, direction="incoming")
 
             # Start speaker alarm once (not per-alert)
-            start_speaker_alarm()
+            first = alerts[0]
+            what = ("VarAC message" if first["type"] == "vmail" else "Relay alert") + f" from {first.get('from_name') or first.get('from_call')}"
+            if len(alerts) > 1:
+                what += f" (+{len(alerts) - 1} more)"
+            start_speaker_alarm(what)
 
             # Send Pushover notifications (network I/O — must be outside lock)
             for a in alerts:
@@ -4023,6 +4082,7 @@ def api_status():
             "aprs_last_ack": state["aprs_last_ack"],
             "winlink_last_position": state["winlink_last_position"],
             "alarm_silenced": state["alarm_silenced"],
+            "speaker_alarm_active": _speaker_alarm_active,
             "internet_up": state["internet_up"],
             "config": cfg_snap,
             "csrf_token": _csrf_token,
@@ -4121,9 +4181,7 @@ def api_delete_vmail():
 def api_dismiss_from_phone():
     """Silence the alarm from a phone link. Alerts remain in pending so the
     dashboard still shows them as new messages (user can reply from the PC)."""
-    stop_speaker_alarm()
-    with slock:
-        state["alarm_silenced"] = True
+    stop_speaker_alarm(silence=True)
     log.info("Alarm silenced from phone (alerts remain pending for reply)")
     return """<html><head><meta name="viewport" content="width=device-width,initial-scale=1">
     <style>body{font-family:system-ui;text-align:center;padding:40px 20px;background:#f0fdf4;color:#166534}
@@ -4133,9 +4191,7 @@ def api_dismiss_from_phone():
 @app.route("/api/stop_alarm", methods=["POST"])
 def api_stop_alarm():
     """Stop the PC speaker alarm without removing alerts from pending."""
-    stop_speaker_alarm()
-    with slock:
-        state["alarm_silenced"] = True
+    stop_speaker_alarm(silence=True)
     return jsonify({"ok": True})
 
 @app.route("/api/pushover_reply")
@@ -5625,6 +5681,7 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
       <div style="min-width:0"><h1>HamLink Radio<span class="demo-tag hidden" id="demoTag">Demo</span></h1><div class="sub" id="headerSub">Waiting for messages…</div></div>
     </div>
     <div class="header-actions">
+      <button class="btn icon" id="btnHeaderSilence" onclick="headerSilence()" title="Silence every HamLink alert sound now (PC speaker and browser)" aria-label="Silence alerts">🔔</button>
       <button class="btn icon" id="btnTheme" onclick="toggleTheme()" title="Switch between light and dark theme" aria-label="Toggle theme">🌙</button>
       <button class="btn icon" onclick="openSett()" title="Settings: callsigns, channels, alerts, maps, updates" aria-label="Settings">⚙️</button>
     </div>
@@ -6484,6 +6541,9 @@ function render(){
   const ringing = alerting.length > 0 && !d.alarm_silenced;
   if (ringing) startAlarm(alerting[alerting.length - 1].from_name || ''); else stopAlarm();
   show('heroActions', d.pending.length > 0); show('btnSilence', ringing);
+  const hb = $('btnHeaderSilence'); const anyRinging = ringing || !!d.speaker_alarm_active;
+  hb.textContent = anyRinging ? '🔕' : '🔔'; hb.classList.toggle('danger', anyRinging);
+  hb.title = anyRinging ? 'Alarm is sounding — click to silence it' : 'No alarm sounding. Click to silence anyway / check where a sound is coming from';
   $('btnCloseAll').textContent = d.pending.length > 1 ? '✓ Mark all ' + d.pending.length + ' as read' : '✓ Mark as read';
 
   const active = [...d.pending].reverse();
@@ -6593,6 +6653,15 @@ function silenceAll(){
   render();
 }
 function _afterLocalChange(){ silenceAll(); }
+/* Header bell: silences whatever is ringing, and says so if nothing is —
+   which means the sound comes from somewhere else (VarAC, Pat, another tab). */
+function headerSilence(){
+  const d = last || {};
+  const browserRinging = !!alarmInt, pcRinging = !!d.speaker_alarm_active;
+  silenceAll();
+  if (browserRinging || pcRinging) toast('🔕 Alarm silenced' + (pcRinging ? ' (PC speaker stopped)' : ''));
+  else toast('No HamLink alarm is sounding right now. If you still hear something, it is coming from VarAC, Pat, or another open HamLink tab — reload that tab.');
+}
 function dismiss(id){ dismissedIds.add(id); silenceAll(); }              // soft: silence, keep in New Messages
 function dismissAll(){ if (last) last.pending.forEach(a => dismissedIds.add(a.id)); silenceAll(); }
 function closeAll(){                                                    // hard: acknowledge everything server-side
@@ -6745,7 +6814,7 @@ const val = id => $(id).value.trim();
 
 async function openSett(){ await fillForm(); loadPatConfig(); $('settOverlay').classList.add('open'); }
 function closeSett(){ $('settOverlay').classList.remove('open'); $('fb').classList.remove('open'); }
-document.addEventListener('keydown', e => { if (e.key === 'Escape'){ closeSett(); closeSitrep(); cancelNcRfSend(); if (!_updPollTimer) closeUpdate(); } });
+document.addEventListener('keydown', e => { if (e.key === 'Escape'){ closeSett(); closeSitrep(); cancelNcRfSend(); if (!_updPollTimer) closeUpdate(); if (alarmInt || (last && last.speaker_alarm_active)) silenceAll(); } });
 
 function _stateBadges(c){
   const set = (id, on) => { const el = $(id); el.textContent = on ? 'On' : 'Off'; el.classList.toggle('on', !!on); };
