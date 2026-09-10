@@ -16,7 +16,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, request, Response
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 UPDATE_REPO = "KK4ODA/HamLink-Radio"   # GitHub repo checked for new releases
 
 # ---------------------------------------------------------------------------
@@ -5763,11 +5763,21 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
       <details class="sec" open>
         <summary>👤 People &amp; callsigns</summary>
         <div class="sec-body">
-          <div class="fg"><label class="fl">Their name (shown in alerts)</label><input class="fi" id="cName" placeholder="e.g. Alex"></div>
-          <div class="fg"><label class="fl">Home station callsign (used for replies)</label><input class="fi" id="cHomeCall" placeholder="e.g. W1AW">
-            <div class="fhint">Base callsign only, no SSID. The APRS SSID (e.g. -5) is added in the APRS section.</div></div>
-          <div class="fg"><label class="fl">Watch for callsign(s)</label><input class="fi" id="cWatch" placeholder="e.g. W1AW/P, W1AW">
-            <div class="fhint">Comma-separated, matched against the sender as VarAC and Winlink show it (usually <code>CALL</code> or <code>CALL/P</code>). APRS SSIDs are set in the APRS section. Leave empty to alert on every sender.</div></div>
+          <div class="notice blue" style="margin:0 0 14px">
+            <b>How callsigns work in HamLink</b><br>
+            Enter the <b>base callsign without an SSID</b> here (e.g. <code>KK4ODA</code>, not <code>KK4ODA-1</code>). Each channel then derives its own address:
+            <ul style="margin:6px 0 0 18px">
+              <li><b>VarAC</b> — uses the base callsign as-is (VMails to/from <code>KK4ODA</code>; the traveler usually appears as <code>KK4ODA/P</code>).</li>
+              <li><b>APRS</b> — base callsign <b>+ the SSIDs set in the APRS section</b> (home <code>-5</code>, traveler <code>-7</code>/<code>-9</code>). Do not type SSIDs here.</li>
+              <li><b>Winlink</b> — uses the base callsign to log in, but messages go between the <b>tactical addresses</b> set in the Winlink section.</li>
+            </ul>
+            <div id="callPreview" style="margin-top:8px;font-family:var(--mono);font-size:12px"></div>
+          </div>
+          <div class="fg"><label class="fl">Their name (shown in alerts)</label><input class="fi" id="cName" placeholder="e.g. Alex"><div class="fhint">The traveler's first name. Used in "New message from …" and in the Send Message button.</div></div>
+          <div class="fg"><label class="fl">Home station callsign — base only, no SSID</label><input class="fi" id="cHomeCall" placeholder="e.g. KK4ODA" oninput="updateCallPreview()">
+            <div class="fhint">The licensed callsign of the home station. Used for: VarAC replies (<i>from</i> address), the APRS-IS login and home address (with the APRS SSID added), and the beacon. <b>No -SSID, no /P.</b></div></div>
+          <div class="fg"><label class="fl">Watch for callsign(s) — VarAC and Winlink senders</label><input class="fi" id="cWatch" placeholder="e.g. KK4ODA, KK4ODA/P" oninput="updateCallPreview()">
+            <div class="fhint">Comma-separated. Alerts fire only for VMails and Winlink mail <i>from</i> these, matched exactly as the sender appears in VarAC or Winlink — normally the base callsign and its portable form (<code>KK4ODA, KK4ODA/P</code>). <b>APRS SSIDs do not belong here</b>; set them in the APRS section. Leave empty to alert on every sender.</div></div>
         </div>
       </details>
 
@@ -5836,10 +5846,10 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
         <div class="sec-body">
           <div class="fg"><div class="tgl-row"><label class="fl">Enable APRS-IS</label><div class="tgl" id="cAprsOn" onclick="this.classList.toggle('on')"></div></div>
             <div class="fhint">Two-way short messages and position tracking through the APRS internet network.</div></div>
-          <div class="fg"><label class="fl">Home station SSID</label><input class="fi w-xs" id="cAprsSsid" placeholder="-5">
-            <div class="fhint">Appended to your home callsign (e.g. W1AW-5). Messages to this address trigger alerts.</div></div>
-          <div class="fg"><label class="fl">Traveler SSID(s)</label><input class="fi w-sm" id="cAprsTravSsid" placeholder="-7, -9">
-            <div class="fhint">Comma-separated. Messages addressed to any of these also alert; replies go to the sender.</div></div>
+          <div class="fg"><label class="fl">Home station APRS SSID (just the -number)</label><input class="fi w-xs" id="cAprsSsid" placeholder="-5" oninput="updateCallPreview()">
+            <div class="fhint">Enter only the suffix, e.g. <code>-5</code>. It is added to the home callsign from the People section to make the home APRS address (<code>KK4ODA-5</code>). The traveler sends APRS messages <b>to</b> this address. <code>-5</code> is conventional for a home/fixed station; use anything from -0 to -15 that is not already used by one of your other radios.</div></div>
+          <div class="fg"><label class="fl">Traveler APRS SSID(s) (just the -numbers)</label><input class="fi w-sm" id="cAprsTravSsid" placeholder="-7, -9" oninput="updateCallPreview()">
+            <div class="fhint">Comma-separated suffixes, e.g. <code>-7, -9</code> (<code>-7</code> = handheld, <code>-9</code> = mobile/car by APRS convention). Added to the same base callsign to form the traveler's APRS addresses (<code>KK4ODA-7</code>, <code>KK4ODA-9</code>). Position beacons and messages from these are tracked; replies go to whichever one last sent a message, or the first listed.</div></div>
           <div class="fg"><label class="fl">APRS-IS passcode</label>
             <div class="frow"><input class="fi" id="cAprsPass" placeholder="12345"><button class="btn sm" onclick="genPasscode()">Auto-generate</button></div>
             <div class="fhint">Derived from your callsign.</div></div>
@@ -5928,15 +5938,15 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
 
           <div class="subhead">Pat Winlink account</div>
           <div class="fhint" style="margin-bottom:10px">These are written to Pat's own config file.</div>
-          <div class="fg"><label class="fl">Winlink callsign</label><input class="fi w-sm" id="cPatCall" placeholder="W1AW"></div>
-          <div class="fg"><label class="fl">Winlink password</label><input class="fi w-md" id="cPatPass" type="password" placeholder="Secure login password" autocomplete="off"></div>
+          <div class="fg"><label class="fl">Winlink callsign — base only, no SSID</label><input class="fi w-sm" id="cPatCall" placeholder="KK4ODA"><div class="fhint">The callsign registered with Winlink, exactly as on winlink.org (e.g. <code>KK4ODA</code>). Pat logs in to the CMS with it. No -SSID.</div></div>
+          <div class="fg"><label class="fl">Winlink password</label><input class="fi w-md" id="cPatPass" type="password" placeholder="Secure login password" autocomplete="off"><div class="fhint">Your Winlink account password (the one used for Winlink Express or winlink.org).</div></div>
           <div class="fg"><label class="fl">Grid locator</label>
             <div class="frow"><input class="fi w-xs" id="cPatLoc" placeholder="EM73" style="flex:0"><button class="btn sm" onclick="detectLocation()">📍 Use my location</button></div>
             <div class="fhint">Maidenhead grid square — used to find nearby gateways.</div></div>
           <div class="subhead">Tactical addresses</div>
-          <div class="fhint" style="margin-bottom:10px">Winlink does not allow sending to yourself. Tactical addresses give the home station and the traveler separate Winlink identities.</div>
-          <div class="fg"><label class="fl">Home station address</label><input class="fi w-sm" id="cPatHomeTac" placeholder="e.g. HOMEBASE"><div class="fhint">The home station sends FROM this address (3–12 letters; dash + numbers OK).</div></div>
-          <div class="fg"><label class="fl">Traveler address</label><input class="fi w-sm" id="cPatTravTac" placeholder="e.g. ROADTRIP"><div class="fhint">Messages are sent TO this address by default.</div></div>
+          <div class="fhint" style="margin-bottom:10px">Winlink refuses mail from a callsign to itself, and both of you share one callsign. Tactical addresses are extra Winlink mailboxes attached to that callsign, so home and traveler each get their own. They are <b>not callsigns</b>: pick a word (3–12 letters, digits allowed after a dash), e.g. <code>BRECKEN</code> and <code>FACUNDO</code>. The traveler must add their own tactical address in their Winlink program too.</div>
+          <div class="fg"><label class="fl">Home station tactical address</label><input class="fi w-sm" id="cPatHomeTac" placeholder="e.g. BRECKEN" oninput="updateCallPreview()"><div class="fhint">Home sends Winlink mail <b>from</b> this address, and the traveler sends <b>to</b> it. HamLink registers it in Pat as an auxiliary address when you press Save Pat configuration.</div></div>
+          <div class="fg"><label class="fl">Traveler tactical address</label><input class="fi w-sm" id="cPatTravTac" placeholder="e.g. FACUNDO" oninput="updateCallPreview()"><div class="fhint">Home sends Winlink replies <b>to</b> this address, and alerts only for mail <b>from</b> it. The traveler must set up this same address in Winlink Express / Pat on their end.</div></div>
           <div class="fg"><button class="btn sm primary" onclick="savePatConfig()">Save Pat configuration</button> <span id="patSaveStatus" class="fhint" style="display:inline;margin-left:8px"></span></div>
 
           <div class="subhead">RF fallback (VARA FM)</div>
@@ -5944,8 +5954,9 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
             <div class="fhint">Blocked by default at send time — requires a licensed operator present or the emergency exception.</div></div>
           <div class="fg"><label class="fl">RF gateway poll interval (seconds)</label><input class="fi w-sm" id="cPatRfPoll" type="number" min="600" max="43200" value="10800"><div class="fhint">Default 10800 (3 hours). Minimum 600.</div></div>
           <div class="fg"><label class="fl">VARA FM gateway</label>
-            <div class="frow"><input class="fi w-sm" id="cPatRfGw" placeholder="e.g. W3ADO-10" style="flex:0"><button class="btn sm" onclick="loadGateways()">Find nearby</button></div>
-            <div class="gw fhint" id="gwList"></div></div>
+            <div class="frow"><input class="fi w-sm" id="cPatRfGw" placeholder="e.g. WD5EMA-10" style="flex:0"><button class="btn sm" onclick="loadGateways()">Find nearby</button></div>
+            <div class="gw fhint" id="gwList"></div>
+            <div class="fhint">The gateway station's <b>callsign with its SSID</b>, exactly as listed by Winlink — the SSID is part of the name here (e.g. <code>WD5EMA-10</code>; RMS gateways are usually <code>-10</code>). Use a dash, not =. This is another ham's station, not yours.</div></div>
           <div class="fg"><label class="fl">VARA FM executable path</label>
             <div class="frow"><input class="fi" id="cPatVaraExe" placeholder="C:\VARA FM\VARAFM.exe"><button class="btn sm" onclick="runTest('exe', 'varaExeTr', {path: val('cPatVaraExe')})" title="Check that the file exists">Test</button></div>
             <div class="tr" id="varaExeTr"></div><div class="fhint">Leave blank if VARA FM is already running.</div></div>
@@ -6660,6 +6671,7 @@ async function fillForm(){
   document.querySelectorAll('.tr').forEach(t => { if (!/^(dbTr|poTr|updTr)$/.test(t.id)) t.className = 'tr'; });
   if (last){ $('cfgPath').textContent = last.config_path || 'config.json'; $('cfgSaved').textContent = last.config_saved_at ? 'Last saved ' + fmtTime(last.config_saved_at) : 'Loaded from disk at startup'; }
   show('saveWarnings', false);
+  updateCallPreview();
   setOn('cBcnOn', b.enabled); $('cBcnLat').value = b.lat || ''; $('cBcnLon').value = b.lon || '';
   $('cBcnSymbol').value = (b.symbol_table || '/') + (b.symbol_code || '-') + ' ';
   $('cBcnInterval').value = b.interval_minutes || 30; $('cBcnComment').value = b.comment || 'HamLink Radio';
@@ -6804,6 +6816,24 @@ async function loadMapList(){
 }
 async function mapSelect(f){ const r = await cpost('/api/map/select', {file: f}); const d = await r.json(); if (d.ok){ toast('Offline map: ' + f); loadMapList(); poll(); } else toast(d.error, true); }
 async function mapDelete(f){ if (!confirm('Delete ' + f + '? This removes the downloaded tiles.')) return; const r = await cpost('/api/map/delete', {file: f}); const d = await r.json(); if (d.ok){ toast('Deleted ' + f); loadMapList(); poll(); } else toast(d.error, true); }
+
+/* ---------- live "how your callsign is used" preview in Settings ---------- */
+function updateCallPreview(){
+  const el = $('callPreview'); if (!el) return;
+  const base = val('cHomeCall').toUpperCase();
+  if (!base){ el.textContent = 'Enter the home callsign to see the addresses HamLink will use.'; return; }
+  const bad = /[-\/]/.test(base);
+  const b = base.split(/[-\/]/)[0];
+  const hs = val('cAprsSsid') || '-5';
+  const ts = (val('cAprsTravSsid') || '-7').split(',').map(s => s.trim()).filter(Boolean).map(s => s.startsWith('-') ? s : '-' + s);
+  const ht = val('cPatHomeTac').toUpperCase() || '(home tactical)', tt = val('cPatTravTac').toUpperCase() || '(traveler tactical)';
+  const watch = val('cWatch').toUpperCase() || '(everyone)';
+  let s = (bad ? '⚠️ "' + esc(base) + '" contains an SSID or suffix — use just ' + esc(b) + '.\n' : '')
+    + 'VarAC:   home ' + esc(b) + '  ·  alerts from ' + esc(watch) + '\n'
+    + 'APRS:    home ' + esc(b + hs) + '  ·  traveler ' + ts.map(x => esc(b + x)).join(', ') + '\n'
+    + 'Winlink: home ' + esc(ht) + '  ·  traveler ' + esc(tt) + '  (login as ' + esc(b) + ')';
+  el.innerHTML = s.replace(/\n/g, '<br>');
+}
 
 /* ---------- tooltips: give every settings control a title from its label + hint ---------- */
 function initTooltips(){
