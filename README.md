@@ -160,4 +160,6 @@ report helps just as much.
 
 ## License
 
-[MIT](LICENSE). 73 de KK4ODA.
+Copyright (C) 2026 KK4ODA. Released under the GNU General Public License v3.0, see [LICENSE](LICENSE). HamLink uses [aprslib](https://github.com/rossengeorgiev/aprs-python), which is GPL, and the Windows build bundles it, so the GPL covers the app as a whole. Versions up to v0.4.9 were published under the MIT License and remain available under it.
+
+73 de KK4ODA.
